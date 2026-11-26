@@ -47,6 +47,7 @@ var identityAssemblyProviders = wire.NewSet(
 	identityprovider.NewTencentCaptchaVerifier,
 	identityprovider.NewAliyunCaptchaVerifier,
 	provideIdentityHTTP,
+	provideCentralIdentity,
 	provideIdentityAuthGraph,
 	provideIdentityProfiles,
 	identitypostgres.NewUserStore,

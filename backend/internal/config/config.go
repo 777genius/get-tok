@@ -145,6 +145,8 @@ type Config struct {
 	WeChat WeChatConnectConfig `mapstructure:"wechat_connect"`
 	// OIDC login deployment settings
 	OIDC OIDCConnectConfig `mapstructure:"oidc_connect"`
+	// CentralIdentity pins shared authority independently of legacy OIDC settings.
+	CentralIdentity authconfig.CentralIdentityConfig `mapstructure:"central_identity"`
 	// DingTalk login deployment settings
 	DingTalk DingTalkConnectConfig `mapstructure:"dingtalk_connect"`
 	// GitHub login deployment settings
@@ -2468,6 +2470,22 @@ func setDefaults() {
 	viper.SetDefault("wechat_connect.redirect_url", "")
 	viper.SetDefault("wechat_connect.frontend_redirect_url", defaultWeChatConnectFrontendRedirect)
 
+	// Shared authentication remains opt-in; keys also admit environment overrides.
+	viper.SetDefault("central_identity.enabled", false)
+	viper.SetDefault("central_identity.origin", "")
+	viper.SetDefault("central_identity.api_url", "")
+	viper.SetDefault("central_identity.issuer_url", "")
+	viper.SetDefault("central_identity.authority_incarnation", "")
+	viper.SetDefault("central_identity.consumer_id", "gettok")
+	viper.SetDefault("central_identity.client_id", "")
+	viper.SetDefault("central_identity.client_secret", "")
+	viper.SetDefault("central_identity.workload_client_id", "")
+	viper.SetDefault("central_identity.workload_client_secret", "")
+	viper.SetDefault("central_identity.provider_name", "Agent Teams")
+	viper.SetDefault("central_identity.providers", []string{"github", "gitlab"})
+	viper.SetDefault("central_identity.test_loopback", false)
+	viper.SetDefault("central_identity.test_binding_profile", "")
+
 	// Generic OIDC login.
 	viper.SetDefault("oidc_connect.enabled", false)
 	viper.SetDefault("oidc_connect.provider_name", "OIDC")
@@ -3233,6 +3251,9 @@ func (c *Config) Validate() error {
 		warnIfInsecureURL("wechat_connect.frontend_redirect_url", weChat.FrontendRedirectURL)
 	}
 	if err := c.validateOIDC(); err != nil {
+		return err
+	}
+	if err := c.CentralIdentity.Validate(); err != nil {
 		return err
 	}
 	if c.Billing.CircuitBreaker.Enabled {

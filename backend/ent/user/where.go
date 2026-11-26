@@ -80,6 +80,11 @@ func PasswordHash(v string) predicate.User {
 	return predicate.User(sql.FieldEQ(FieldPasswordHash, v))
 }
 
+// CentralManaged applies equality check predicate on the "central_managed" field. It's identical to CentralManagedEQ.
+func CentralManaged(v bool) predicate.User {
+	return predicate.User(sql.FieldEQ(FieldCentralManaged, v))
+}
+
 // Role applies equality check predicate on the "role" field. It's identical to RoleEQ.
 func Role(v string) predicate.User {
 	return predicate.User(sql.FieldEQ(FieldRole, v))
@@ -443,6 +448,16 @@ func PasswordHashEqualFold(v string) predicate.User {
 // PasswordHashContainsFold applies the ContainsFold predicate on the "password_hash" field.
 func PasswordHashContainsFold(v string) predicate.User {
 	return predicate.User(sql.FieldContainsFold(FieldPasswordHash, v))
+}
+
+// CentralManagedEQ applies the EQ predicate on the "central_managed" field.
+func CentralManagedEQ(v bool) predicate.User {
+	return predicate.User(sql.FieldEQ(FieldCentralManaged, v))
+}
+
+// CentralManagedNEQ applies the NEQ predicate on the "central_managed" field.
+func CentralManagedNEQ(v bool) predicate.User {
+	return predicate.User(sql.FieldNEQ(FieldCentralManaged, v))
 }
 
 // RoleEQ applies the EQ predicate on the "role" field.

@@ -18,6 +18,7 @@ type AuthenticationHandler struct {
 	// the child for every registered route before serving; methods directly
 	// dispatch through these pointers and do not supply replacements.
 	Session  *SessionHandler      // password and session HTTP operations
+	Central  *CentralHandler      // optional central cookie authentication
 	Pending  *PendingHandler      // browser pending identity operations
 	Bind     *OAuthBindHandler    // temporary current-user binding cookies
 	LinuxDo  *LinuxDoHandler      // LinuxDo OAuth HTTP operations
@@ -191,7 +192,13 @@ func (h *AuthenticationHandler) Login2FA(c *gin.Context) { h.Session.Login2FA(c)
 
 // Logout delegates to the child handler that attempts refresh-token revocation
 // and invokes the configured browser pending logout callback.
-func (h *AuthenticationHandler) Logout(c *gin.Context) { h.Session.Logout(c) }
+func (h *AuthenticationHandler) Logout(c *gin.Context) {
+	if h.Central != nil && h.Central.HasCookie(c) {
+		h.Central.Logout(c)
+		return
+	}
+	h.Session.Logout(c)
+}
 
 // OIDCOAuthCallback delegates to the child handler that validates configured
 // OIDC token proof and resolves a namespaced provider subject.
@@ -222,7 +229,13 @@ func (h *AuthenticationHandler) ResetPassword(c *gin.Context) { h.Session.ResetP
 
 // RevokeAllSessions delegates to the child handler that requests
 // refresh-session revocation for the currently authenticated account.
-func (h *AuthenticationHandler) RevokeAllSessions(c *gin.Context) { h.Session.RevokeAllSessions(c) }
+func (h *AuthenticationHandler) RevokeAllSessions(c *gin.Context) {
+	if h.Central != nil && h.Central.HasCookie(c) {
+		h.Central.RevokeAll(c)
+		return
+	}
+	h.Session.RevokeAllSessions(c)
+}
 
 // SendPendingOAuthVerifyCode delegates to the child handler that requests
 // signup email proof for the current browser-bound pending provider flow.

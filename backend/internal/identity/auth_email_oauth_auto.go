@@ -154,6 +154,9 @@ func (s *AuthService) AuthLoginOrRegisterVerifiedEmailOAuth(
 	if !user.IsActive() {
 		return nil, nil, ErrUserNotActive
 	}
+	if user.CentralManaged {
+		return nil, nil, ErrCentralLoginRequired
+	}
 	// Save the stable provider relationship before optional profile/grant work
 	// and login issuance; failures afterward can leave the completed identity
 	// write in place.

@@ -94,6 +94,12 @@ func validateCurrentJWT(
 		AbortWithError(c, 401, "USER_INACTIVE", "User account is not active")
 		return nil, nil, false
 	}
+	// Every bearer request observes the durable account fence through this fresh
+	// user read, including tokens issued concurrently with central binding activation.
+	if user.CentralManaged {
+		AbortWithError(c, 401, "CENTRAL_LOGIN_REQUIRED", "This account requires central sign-in")
+		return nil, nil, false
+	}
 
 	// Credential changes update the current user fingerprint; comparing it with
 	// the signed version prevents an earlier token from authenticating afterward.

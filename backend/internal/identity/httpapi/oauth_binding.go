@@ -128,7 +128,7 @@ func (h *OAuthBindHandler) ResolveOAuthBindTargetUserID(c *gin.Context) (*int64,
 	if err != nil {
 		return nil, err
 	}
-	if user == nil || !user.IsActive() || claims.TokenVersion != user.TokenVersion {
+	if user == nil || !user.IsActive() || user.CentralManaged || claims.TokenVersion != user.TokenVersion {
 		return nil, identity.ErrInvalidToken
 	}
 	return &user.ID, nil
@@ -188,5 +188,9 @@ func (h *OAuthBindHandler) ReadTargetUser(c *gin.Context, name string, db identi
 	if e != nil {
 		return nil, infraerrors.Unauthorized("AUTH_REQUIRED", "current user is required to bind wechat account")
 	}
-	return db.FindOAuthBindTarget(c.Request.Context(), id)
+	user, err := db.FindOAuthBindTarget(c.Request.Context(), id)
+	if err == nil && user != nil && user.CentralManaged {
+		return nil, identity.ErrCentralLoginRequired
+	}
+	return user, err
 }

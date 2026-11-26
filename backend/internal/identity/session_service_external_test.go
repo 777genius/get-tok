@@ -83,6 +83,20 @@ func TestAuthService_RefreshToken_ExpiredTokenNoPanic(t *testing.T) {
 	})
 }
 
+// TestCentralOwnershipRejectsLegacyRenewal retains an expired legacy credential
+// while activating central ownership, so renewal cannot cross that durable fence.
+func TestCentralOwnershipRejectsLegacyRenewal(t *testing.T) {
+	user := &identity.User{ID: 1, Email: "central@example.invalid", Role: identity.RoleUser, Status: billing.StatusActive, TokenVersion: 1}
+	service := newAuthService(&userRepoStub{user: user}, nil, nil)
+	service.Options.JWT.ExpireHour = -1
+	rebuildSessionForTest(service)
+	old, err := service.GenerateToken(t.Context(), user)
+	require.NoError(t, err)
+	user.CentralManaged = true
+	_, err = service.RefreshToken(t.Context(), old)
+	require.ErrorIs(t, err, identity.ErrCentralLoginRequired)
+}
+
 // TestAuthService_GetAccessTokenExpiresIn_FallbackToExpireHour disables the
 // minute lifetime and sets twenty-four legacy hours. It requires the client
 // lifetime accessor to report the matching number of seconds after rebuilding

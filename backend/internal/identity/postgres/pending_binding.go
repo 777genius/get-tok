@@ -602,6 +602,15 @@ func ApplyPendingOAuthBindingTx(
 		}
 		targetUserID = resolvedUserID
 	}
+	// Serialize legacy provider adoption with central ownership activation. A
+	// preflight JWT or password check cannot authorize writes after that commit.
+	current, err := tx.Client().User.Query().Where(dbuser.IDEQ(targetUserID)).ForUpdate().Only(ctx)
+	if err != nil {
+		return err
+	}
+	if current.CentralManaged {
+		return identitycore.ErrCentralLoginRequired
+	}
 
 	adoptedDisplayName := ""
 	if decision != nil && decision.AdoptDisplayName {

@@ -137,6 +137,24 @@ func TestJWTAuth_ValidToken(t *testing.T) {
 	require.Equal(t, "user", body["role"])
 }
 
+// TestJWTAuthCentralFenceRejectsAlreadyIssuedToken changes only the fresh
+// ownership flag after issuance, proving a cached old JWT cannot bypass binding.
+func TestJWTAuthCentralFenceRejectsAlreadyIssuedToken(t *testing.T) {
+	user := &identity.User{ID: 1, Email: "central@example.invalid", Role: "user", Status: billing.StatusActive, TokenVersion: 1}
+	router, sessions := newJWTTestEnv(map[int64]*identity.User{1: user})
+	token, err := sessions.GenerateToken(t.Context(), user)
+	require.NoError(t, err)
+	user.CentralManaged = true
+	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	writer := httptest.NewRecorder()
+	router.ServeHTTP(writer, request)
+	require.Equal(t, http.StatusUnauthorized, writer.Code)
+	require.Contains(t, writer.Body.String(), "CENTRAL_LOGIN_REQUIRED")
+	_, err = sessions.GenerateToken(t.Context(), user)
+	require.ErrorIs(t, err, identity.ErrCentralLoginRequired)
+}
+
 // TestJWTAuth_ValidToken_LowercaseBearer uses a lowercase bearer scheme with a
 // valid signed account token. It checks that case-insensitive scheme admission
 // reaches the protected route with HTTP 200.

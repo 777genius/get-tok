@@ -120,7 +120,10 @@ type CentralResolution struct {
 
 // CentralSession records one server-owned product session without storing browser tokens.
 type CentralSession struct {
-	Digest      string                  // SHA-256 opaque cookie digest
+	Digest string // SHA-256 opaque cookie digest
+	// CSRFSecret is independent of the cookie and is disclosed only through the
+	// same-origin session response. It cannot authenticate without that HttpOnly cookie.
+	CSRFSecret  string
 	LocalUserID int64                   // unchanged product account identifier
 	Account     CentralAccountReference // bound central account reference
 	// Issued security and attachment counters are immutable. A mismatch requires

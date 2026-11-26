@@ -96,6 +96,7 @@ func provideAuthRouteMount(eModelMarketplace *routinghttp.MarketplaceHandler,
 			return security.AuthLimiter.LimitWithOptions(key, n, window, servermiddleware.RateLimitOptions{FailureMode: servermiddleware.RateLimitFailClose})
 		}}
 		identityhttp.RegisterAuthenticationRoutes(v1, eAuth, ePasskey, guards, func(group *gin.RouterGroup) { paymenthttp.RegisterWeChatAuthRoutes(group, eAuth) })
+		identityhttp.RegisterCentralAuthenticationRoutes(v1, eAuth.Central, guards)
 		public := v1.Group("/settings")
 		public.Use(security.Panel.PublicIP())
 		sitehttp.RegisterPublicSettingsRoutes(public, ePublicSettings)

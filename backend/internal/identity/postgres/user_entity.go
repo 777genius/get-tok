@@ -48,6 +48,7 @@ func UserFromEntity(u *dbent.User) *identitycore.User {
 		Username:                   u.Username,
 		Notes:                      u.Notes,
 		PasswordHash:               u.PasswordHash,
+		CentralManaged:             u.CentralManaged,
 		Role:                       u.Role,
 		Balance:                    u.Balance,
 		FrozenBalance:              u.FrozenBalance,

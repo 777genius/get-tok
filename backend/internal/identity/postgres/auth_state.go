@@ -28,7 +28,7 @@ import (
 //
 // Transaction selection differs by operation. First-bind grants and
 // bound-email updates join an injected Ent transaction or own one, while
-// registered-user creation opens its configured transaction and database-free
+// registered-user creation joins an injected transaction or opens its own, and database-free
 // fixtures call their repositories directly. Optional steps use savepoints
 // when a transaction is injected so their failures can be returned after
 // recovery. Email backfill and timestamp/source observations deliberately
@@ -181,7 +181,7 @@ ON CONFLICT (user_id, provider_type, grant_reason) DO NOTHING`,
 //
 // The work rechecks enforced domain policy and normalized-email availability
 // in its operation context before account creation and invitation use. A
-// configured Ent client opens an owned transaction; database-free fixtures run
+// configured Ent client joins an injected transaction or opens its own; database-free fixtures run
 // the supplied repositories directly. Domain quota requires the atomic
 // repository capability when a database is configured, while its absent
 // fixture capability uses ordinary creation. Repository writes can mutate the
@@ -262,7 +262,7 @@ func (s *AuthState) AuthCreateRegisteredUser(ctx context.Context, user *identity
 		return nil
 	}
 
-	if s.entClient == nil {
+	if s.entClient == nil || dbent.TxFromContext(ctx) != nil {
 		return run(ctx)
 	}
 

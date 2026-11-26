@@ -210,7 +210,11 @@ func (s *SessionService) GenerateToken(ctx context.Context, user *User) (string,
 // sessionID and bindingHash are copied as provided, and the credential version
 // is resolved from the user. Positive minute lifetime takes precedence over the
 // retained hour lifetime; this signing step performs no account-status lookup.
+// A supplied central-managed account cannot receive a legacy access credential.
 func (s *SessionService) GenerateAccessToken(user *User, sessionID, bindingHash string) (string, error) {
+	if user.CentralManaged {
+		return "", ErrCentralLoginRequired
+	}
 	now := s.now()
 	var expiresAt time.Time
 	if s.options.AccessTokenExpireMinutes > 0 {
@@ -314,6 +318,9 @@ func (s *SessionService) RefreshToken(ctx context.Context, oldTokenString string
 	if !user.IsActive() {
 		return "", ErrUserNotActive
 	}
+	if user.CentralManaged {
+		return "", ErrCentralLoginRequired
+	}
 
 	// Reject tokens issued against a different credential fingerprint.
 	if claims.TokenVersion != ResolvedTokenVersion(user) {
@@ -377,6 +384,7 @@ func (s *SessionService) GenerateTokenPair(ctx context.Context, user *User, fami
 // GenerateRefreshToken stores a random refresh credential's digest and returns
 // its raw text. Callers provide a non-nil user, configured cache and validated
 // lifetime options; an empty family ID generates a new session family.
+// Central-managed accounts are rejected before any credential or cache write.
 //
 // Metadata records one clock observation and its derived expiry before the user
 // and family index writes are attempted. Record storage errors prevent
@@ -385,6 +393,9 @@ func (s *SessionService) GenerateTokenPair(ctx context.Context, user *User, fami
 // revocation index, so index membership is a cleanup aid rather than a complete
 // token ledger.
 func (s *SessionService) GenerateRefreshToken(ctx context.Context, user *User, familyID string) (string, error) {
+	if user.CentralManaged {
+		return "", ErrCentralLoginRequired
+	}
 	// Thirty-two random bytes become sixty-four hexadecimal refresh credential
 	// characters.
 	tokenBytes := make([]byte, 32)
@@ -510,6 +521,10 @@ func (s *SessionService) RefreshTokenPair(ctx context.Context, refreshToken stri
 		// complete.
 		_ = s.refreshTokenCache.DeleteTokenFamily(ctx, data.FamilyID)
 		return nil, ErrUserNotActive
+	}
+
+	if user.CentralManaged {
+		return nil, ErrCentralLoginRequired
 	}
 
 	// Compare the current credential fingerprint to detect password or email

@@ -59,6 +59,9 @@ func (User) Fields() []ent.Field {
 		field.String("password_hash").
 			MaxLen(255).
 			NotEmpty(),
+		// This sticky authentication fence is activated with the central binding.
+		// Generic profile updates cannot restore legacy human credential authority.
+		field.Bool("central_managed").Default(false).Immutable(),
 		// Global account role.
 		field.String("role").
 			MaxLen(20).

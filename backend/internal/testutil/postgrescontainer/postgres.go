@@ -4,13 +4,16 @@ package postgrescontainer
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
@@ -34,6 +37,9 @@ func New(t *testing.T) *sql.DB {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	if dsn := strings.TrimSpace(os.Getenv("TOKENROUTER_TEST_POSTGRES_DSN")); dsn != "" {
+		return newNative(t, ctx, dsn)
+	}
 	image := strings.TrimSpace(os.Getenv("TOKENROUTER_TEST_POSTGRES_IMAGE"))
 	if image == "" {
 		image = "postgres:18.1-alpine3.23"
@@ -60,6 +66,41 @@ func New(t *testing.T) *sql.DB {
 	dsn, err := container.ConnectionString(ctx, "sslmode=disable", "TimeZone=UTC")
 	require.NoError(t, err)
 	db, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	require.NoError(t, postgresinfra.ApplyMigrations(ctx, db, migrations.FS))
+	return db
+}
+
+// newNative creates an isolated database on an explicitly supplied local test
+// server. It rejects non-loopback hosts and administrator database names without
+// the test suffix, never migrates the administrator database, and removes only
+// its own random database after closing the test pool. This supports native
+// PostgreSQL runners while retaining the same embedded migrations as Docker.
+func newNative(t *testing.T, ctx context.Context, dsn string) *sql.DB {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	require.NoError(t, err)
+	require.Contains(t, []string{"postgres", "postgresql"}, u.Scheme)
+	require.Contains(t, []string{"127.0.0.1", "localhost", "::1"}, u.Hostname())
+	require.True(t, strings.HasSuffix(strings.TrimPrefix(u.Path, "/"), "_test"), "native fixture requires a dedicated *_test administrator database")
+	admin, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, admin.Close()) })
+	var random [12]byte
+	_, err = rand.Read(random[:])
+	require.NoError(t, err)
+	name := "gettok_verification_" + hex.EncodeToString(random[:])
+	_, err = admin.ExecContext(ctx, "CREATE DATABASE "+pq.QuoteIdentifier(name)+" TEMPLATE template0")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_, err := admin.ExecContext(cleanup, "DROP DATABASE "+pq.QuoteIdentifier(name)+" WITH (FORCE)")
+		require.NoError(t, err)
+	})
+	u.Path = "/" + name
+	db, err := sql.Open("postgres", u.String())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	require.NoError(t, postgresinfra.ApplyMigrations(ctx, db, migrations.FS))

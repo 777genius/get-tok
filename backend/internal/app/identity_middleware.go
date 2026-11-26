@@ -30,13 +30,14 @@ func (a identityAuthAudit) RecordBindingMismatch(_ context.Context, event identi
 }
 
 // provideJWTAuth binds identity, settings, and activity recording to JWT middleware.
-func provideJWTAuth(graph *identityAuthGraph, users *identity.UserService, settings *identity.RuntimeSettings, recorder *audit.AuditLogService) identityhttp.JWTAuthMiddleware {
-	return identityhttp.JWTAuthMiddleware(identityhttp.JWTAuth(graph.Core, users, users, settings, identityAuthAudit{recorder}))
+func provideJWTAuth(graph *identityAuthGraph, users *identity.UserService, settings *identity.RuntimeSettings, recorder *audit.AuditLogService, central *identityhttp.CentralHandler) identityhttp.JWTAuthMiddleware {
+	legacy := identityhttp.JWTAuth(graph.Core, users, users, settings, identityAuthAudit{recorder})
+	return identityhttp.JWTAuthMiddleware(central.Wrap(legacy, false))
 }
 
 // provideAdminAuth constructs administrator authentication with shared identity services and audit recording.
-func provideAdminAuth(graph *identityAuthGraph, users *identity.UserService, settings *identity.RuntimeSettings, recorder *audit.AuditLogService, tokens *identity.MCPTokenService) identityhttp.AdminAuthMiddleware {
-	normal := identityhttp.AdminAuth(graph.Core, users, settings, identityAuthAudit{recorder})
+func provideAdminAuth(graph *identityAuthGraph, users *identity.UserService, settings *identity.RuntimeSettings, recorder *audit.AuditLogService, tokens *identity.MCPTokenService, central *identityhttp.CentralHandler) identityhttp.AdminAuthMiddleware {
+	normal := central.Wrap(identityhttp.AdminAuth(graph.Core, users, settings, identityAuthAudit{recorder}), true)
 	return identityhttp.AdminAuthMiddleware(identityhttp.MCPAdminAuth(tokens, normal))
 }
 

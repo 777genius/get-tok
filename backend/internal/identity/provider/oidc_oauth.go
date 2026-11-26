@@ -372,6 +372,16 @@ func GetGJSONBool(body string, path string) (bool, bool) {
 // compatibility afterward. The returned claims keep provider text for the HTTP
 // flow to reconcile with userinfo and select the issuer/subject identity.
 func OidcParseAndValidateIDToken(ctx context.Context, cfg OIDCOptions, idToken string, expectedNonce string) (*OidcIDTokenClaims, error) {
+	jwks, err := OidcFetchJWKSet(ctx, cfg.JWKSURL)
+	if err != nil {
+		return nil, err
+	}
+	return oidcValidateIDTokenWithKeys(cfg, idToken, expectedNonce, jwks)
+}
+
+// oidcValidateIDTokenWithKeys applies the same verification policy to keys loaded
+// by either the compatibility transport or the bounded central-auth transport.
+func oidcValidateIDTokenWithKeys(cfg OIDCOptions, idToken string, expectedNonce string, jwks *OidcJWKSet) (*OidcIDTokenClaims, error) {
 	idToken = strings.TrimSpace(idToken)
 	if idToken == "" {
 		return nil, errors.New("missing id_token")
@@ -381,10 +391,6 @@ func OidcParseAndValidateIDToken(ctx context.Context, cfg OIDCOptions, idToken s
 		return nil, errors.New("empty allowed signing algorithms")
 	}
 
-	jwks, err := OidcFetchJWKSet(ctx, cfg.JWKSURL)
-	if err != nil {
-		return nil, err
-	}
 	// Convert the settings reader's seconds into JWT time-validation leeway.
 	leeway := time.Duration(cfg.ClockSkewSeconds) * time.Second
 	claims := &OidcIDTokenClaims{}
@@ -657,6 +663,11 @@ func (OIDCClient) ValidateIDToken(ctx context.Context, c OIDCOptions, token, non
 	if e != nil {
 		return nil, e
 	}
+	return oidcVerifiedClaims(v), nil
+}
+
+// oidcVerifiedClaims projects already verified claims without synthesizing flow age.
+func oidcVerifiedClaims(v *OidcIDTokenClaims) *identity.OIDCVerifiedClaims {
 	result := &identity.OIDCVerifiedClaims{
 		Issuer: v.Issuer, Subject: v.Subject, Email: v.Email, PreferredUsername: v.PreferredUsername,
 		Name: v.Name, EmailVerified: v.EmailVerified,
@@ -668,5 +679,5 @@ func (OIDCClient) ValidateIDToken(ctx context.Context, c OIDCOptions, token, non
 		observed := v.AuthTime.UTC()
 		result.AuthenticatedAt = &observed
 	}
-	return result, nil
+	return result
 }

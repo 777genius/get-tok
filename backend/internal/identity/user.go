@@ -69,12 +69,15 @@ type User struct {
 	// hydrated from separate avatar storage. ProfileApplyUserAvatar clears the
 	// complete view when no avatar record is returned, keeping these observations
 	// together.
-	AvatarURL      string  // loaded profile avatar URL
-	AvatarSource   string  // loaded avatar storage provider
-	AvatarMIME     string  // loaded image MIME type
-	AvatarByteSize int     // bytes
-	AvatarSHA256   string  // hexadecimal avatar content digest
-	PasswordHash   string  // stored bcrypt password hash
+	AvatarURL      string // loaded profile avatar URL
+	AvatarSource   string // loaded avatar storage provider
+	AvatarMIME     string // loaded image MIME type
+	AvatarByteSize int    // bytes
+	AvatarSHA256   string // hexadecimal avatar content digest
+	PasswordHash   string // stored bcrypt password hash
+	// CentralManaged is a sticky human-authentication fence, independently of
+	// whether the external binding is currently attached, retired or unavailable.
+	CentralManaged bool
 	Role           string  // stored global account role
 	Balance        float64 // available account balance in USD
 	FrozenBalance  float64 // held account balance in USD
