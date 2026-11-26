@@ -274,7 +274,7 @@ func centralNativeLogin(t *testing.T, client *http.Client, origin, issuer *url.U
 	require.True(t, err == nil, "native provider destination must be a valid URL; diagnostic URL is withheld")
 	require.Equal(t, issuer.Scheme+"://"+issuer.Host, next.Scheme+"://"+next.Host)
 	response, body = centralNativeRequest(t, client, http.MethodGet, next.String(), "", "", "")
-	for attempt := 0; attempt < 8; attempt++ {
+	for range 8 {
 		if response.StatusCode == http.StatusOK {
 			form := regexp.MustCompile(`<form\b[^>]*\baction="([^"]+)"`).FindSubmatch(body)
 			require.Len(t, form, 2, "native Keycloak credential form must be present")

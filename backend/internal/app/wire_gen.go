@@ -184,7 +184,7 @@ func initializeApplication(ctx context.Context, cfg *config.Config, info BuildIn
 	defaultLoadBalancer := providePaymentLoadBalancer(instanceStore, encryptionKey)
 	configService := providePaymentConfigCore(instanceStore, store, encryptionKey, plans)
 	runtime := providePaymentRuntime(client, registry, defaultLoadBalancer, redeemService, subscriptionService, affiliateService, notificationEmailService, instanceStore, groupStore, userStore, configService, encryptionKey, oAuthSettings, tasks, calendar)
-	centralHandler := provideCentralIdentity(cfg, db, appIdentityAuthGraph, userService, appIdentityAuthSettings, totpService, secretEncryptor)
+	centralHandler := provideCentralIdentity(cfg, db, appIdentityAuthGraph, userService, appIdentityAuthSettings, backendMode, totpService, secretEncryptor)
 	appIdentityHTTP := provideIdentityHTTP(appIdentityAuthGraph, userService, cfg, appIdentityAuthSettings, backendMode, publicService, promoService, redeemService, totpService, userAttributeService, tasks, runtime, centralHandler)
 	appAuthRouteMount := provideAuthRouteMount(marketplaceHandler, publicHandler, handler, passkeyHandler, appIdentityHTTP)
 	userHandler := providePromotionUserHTTP(affiliateService)

@@ -17,8 +17,8 @@ import (
 	settingscore "github.com/TokenFlux/TokenRouter/internal/settings"
 )
 
-// Backend-mode guards either permit the configured administrator
-// authentication surface or reject panel self-service. Tests install simple
+// backend_mode_guard_test.go checks the configured administrator
+// authentication surface and rejection of panel self-service. Tests install simple
 // routes and runtime switches, checking user-role handling separately from the
 // public auth-path allowlist and the nil-reader bypass.
 
@@ -120,11 +120,6 @@ func TestBackendModeUserGuard(t *testing.T) {
 		role       *string
 		wantStatus int // expected HTTP response status
 	}{
-		{name: "central_capability_available", enabled: "true", path: "/api/v1/auth/central/config", wantStatus: http.StatusOK},
-		{name: "central_withdrawal_bootstrap_available", enabled: "true", path: "/api/v1/auth/central/session", wantStatus: http.StatusOK},
-		{name: "central_logout_available", enabled: "true", path: "/api/v1/auth/central/logout", wantStatus: http.StatusOK},
-		{name: "central_login_not_admitted", enabled: "true", path: "/api/v1/auth/central/start", wantStatus: http.StatusForbidden},
-		{name: "central_callback_not_admitted", enabled: "true", path: "/api/v1/auth/central/callback", wantStatus: http.StatusForbidden},
 		{
 			name:       "disabled_allows_all",
 			enabled:    "false",
@@ -199,7 +194,8 @@ func TestBackendModeUserGuard(t *testing.T) {
 // TestBackendModeAuthGuard varies runtime enablement across login, callback,
 // pending, and self-service paths. It checks the allowlisted continuation
 // statuses and rejects start, registration, and password-recovery routes under
-// backend mode.
+// backend mode. Central capability, session bootstrap and logout remain
+// available while central login starts and callbacks are rejected.
 func TestBackendModeAuthGuard(t *testing.T) {
 	tests := []struct {
 		name       string // guard fixture case
@@ -208,6 +204,11 @@ func TestBackendModeAuthGuard(t *testing.T) {
 		path       string // requested authentication route path
 		wantStatus int    // expected HTTP response status
 	}{
+		{name: "central_capability_available", enabled: "true", path: "/api/v1/auth/central/config", wantStatus: http.StatusOK},
+		{name: "central_withdrawal_bootstrap_available", enabled: "true", path: "/api/v1/auth/central/session", wantStatus: http.StatusOK},
+		{name: "central_logout_available", enabled: "true", path: "/api/v1/auth/central/logout", wantStatus: http.StatusOK},
+		{name: "central_login_not_admitted", enabled: "true", path: "/api/v1/auth/central/start", wantStatus: http.StatusForbidden},
+		{name: "central_callback_not_admitted", enabled: "true", path: "/api/v1/auth/central/callback", wantStatus: http.StatusForbidden},
 		{
 			name:       "disabled_allows_all",
 			enabled:    "false",
