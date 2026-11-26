@@ -20,8 +20,8 @@ import (
 )
 
 // TestLoadCentralIdentityRequiresPersistentEncryption loads the real environment
-// configuration, requiring a shared configured key before production-form central
-// authentication can retain browser transactions across replicas or restarts.
+// configuration. Production-form central authentication requires a configured
+// key before retaining browser transactions across replicas or process restarts.
 func TestLoadCentralIdentityRequiresPersistentEncryption(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	for name, value := range map[string]string{

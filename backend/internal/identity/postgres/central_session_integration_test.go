@@ -54,8 +54,9 @@ func centralCompletion(now time.Time, account, email, secret string) identity.Ce
 	}
 }
 
-// TestCentralStoreAtomicOwnership proves conditional login consumption,
-// concurrent first ownership, and rollback after a later session-key conflict.
+// TestCentralStoreAtomicOwnership races browser consumption and first account
+// registration against real storage. One owner must survive, while a later
+// session-key conflict rolls back the attempted registration.
 func TestCentralStoreAtomicOwnership(t *testing.T) {
 	store, db, now := centralStoreFixture(t)
 	ctx := t.Context()
@@ -132,8 +133,9 @@ func TestCentralStoreAtomicOwnership(t *testing.T) {
 	require.ErrorIs(t, err, identity.ErrCentralConflict)
 }
 
-// TestCentralStoreBindingAndRevocation fences old credentials at commit while
-// preserving balances and machine keys, then retains newer denial and logout.
+// TestCentralStoreBindingAndRevocation changes legacy credentials around an
+// attempted binding and then withdraws the resulting session. Committed ownership
+// retains balances and machine keys while old authentication and stale status fail.
 func TestCentralStoreBindingAndRevocation(t *testing.T) {
 	store, db, now := centralStoreFixture(t)
 	ctx := t.Context()

@@ -20,7 +20,7 @@ import (
 // alias. Qualifying a recovery policy requires a deliberate configuration and
 // contract change instead of interpreting a boolean as independent proof.
 
-// CentralIdentityConfig holds deployment-pinned central authentication inputs.
+// CentralIdentityConfig holds startup-pinned authority, browser and workload authentication inputs.
 type CentralIdentityConfig struct {
 	Enabled              bool     `mapstructure:"enabled"`                // explicit shared-authentication activation
 	Origin               string   `mapstructure:"origin"`                 // exact browser origin without trailing slash
@@ -38,8 +38,13 @@ type CentralIdentityConfig struct {
 	TestBindingProfile   string   `mapstructure:"test_binding_profile"`   // optional TEST migration candidate
 }
 
-// Validate rejects incomplete configuration and noncanonical transport boundaries.
-// Strong organizational admission deliberately has no enablement field here.
+// Validate checks deployment inputs only when shared authentication is
+// explicitly enabled. Human and workload clients must differ, and all
+// configured endpoints must be canonical HTTPS URLs outside the separately
+// named loopback TEST profile. Browser origin cannot contain a path, while
+// provider aliases are bounded and unique. The migration candidate is accepted
+// only in TEST mode; stronger organizational assurance deliberately has no
+// configuration switch that an unqualified returned claim could enable.
 func (c CentralIdentityConfig) Validate() error {
 	if !c.Enabled {
 		return nil

@@ -104,8 +104,16 @@ try {
   const page = await context.newPage()
   page.setDefaultTimeout(15_000)
   const pageErrors = [] // Unhandled page exceptions, without their potentially sensitive text.
+  const frontendCallbacks = [] // Actual document destinations observed before SPA cleanup.
   page.on('pageerror', () => {
     pageErrors.push('page-error')
+  })
+  page.on('framenavigated', (frame) => {
+    if (frame !== page.mainFrame()) return
+    const destination = new URL(frame.url())
+    if (destination.pathname === '/auth/central/callback') {
+      frontendCallbacks.push(destination.href)
+    }
   })
 
   phase = 'rendered-login'
@@ -140,6 +148,11 @@ try {
   assert.equal(session.auth_mode, 'central')
   assert.ok(session.user.id > 0 && session.csrf_token.length > 0)
   assert.ok(!['access_token', 'refresh_token', 'id_token'].some((key) => key in session))
+  assert.ok(
+    frontendCallbacks.length > 0 &&
+      frontendCallbacks.every((destination) => destination === `${origin}/auth/central/callback`),
+    'The actual frontend callback must have the exact origin and no credentials or fragment',
+  )
   await page.waitForURL((url) => url.origin === origin && url.pathname === '/dashboard')
   const cookie = (await context.cookies(origin)).find(
     (value) => value.name === 'gettok-central-test',

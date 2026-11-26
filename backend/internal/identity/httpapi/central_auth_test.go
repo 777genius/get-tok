@@ -88,7 +88,9 @@ func TestCentralProtectedReadsRequireSessionProof(t *testing.T) {
 	}
 }
 
-// TestCentralCookieCustody keeps production and TEST cookies visibly distinct.
+// TestCentralCookieCustody exercises both transaction and session cookies in
+// production and loopback TEST profiles. Browser attributes must retain their
+// distinct Secure boundary, HttpOnly custody and finite expiration.
 func TestCentralCookieCustody(t *testing.T) {
 	for _, testLoopback := range []bool{false, true} {
 		for _, login := range []bool{false, true} {
@@ -111,7 +113,9 @@ func TestCentralCookieCustody(t *testing.T) {
 	}
 }
 
-// TestCentralOriginRejectsCrossSiteMutation verifies the exact browser origin and host.
+// TestCentralOriginRejectsCrossSiteMutation varies Origin, Host and fetch-site
+// metadata around the configured browser endpoint. Cross-site and sibling-site
+// requests must fail before any application operation can run.
 func TestCentralOriginRejectsCrossSiteMutation(t *testing.T) {
 	for _, row := range []struct {
 		origin   string // supplied Origin header

@@ -30,13 +30,17 @@ type CentralOIDCClient struct {
 	http *http.Client // TLS-verified, bounded credential requests
 }
 
-// NewCentralOIDCClient constructs transport without weakening system certificate checks.
+// NewCentralOIDCClient constructs a reusable bounded transport for the central
+// provider. System certificate checks remain enabled, and redirects return to
+// the caller instead of carrying credentials to a different destination.
 func NewCentralOIDCClient() *CentralOIDCClient {
 	return &CentralOIDCClient{http: &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
-// ExchangeCode redeems the single-use code with mandatory S256 verifier and exact callback.
-// Central configuration uses one confidential client and never accepts a public-client fallback.
+// ExchangeCode redeems the single-use code with its S256 verifier and exact
+// configured callback. The confidential central client has no public-client
+// fallback, and any returned refresh credential is discarded by this finite
+// session profile.
 func (c *CentralOIDCClient) ExchangeCode(ctx context.Context, options OIDCOptions, code, redirect, verifier string) (*identity.OIDCTokenResponse, error) {
 	form := url.Values{"grant_type": {"authorization_code"}, "client_id": {options.ClientID}, "code": {code}, "redirect_uri": {redirect}, "code_verifier": {verifier}}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, options.TokenURL, strings.NewReader(form.Encode()))
@@ -59,7 +63,10 @@ func (c *CentralOIDCClient) ExchangeCode(ctx context.Context, options OIDCOption
 	return &token, nil
 }
 
-// FetchUserInfo retrieves the access credential's subject and optional verified profile.
+// FetchUserInfo retrieves the access credential's subject and optional
+// verified profile through bounded transport. The core must compare that
+// subject with the signed ID token before using any profile data for
+// registration.
 func (c *CentralOIDCClient) FetchUserInfo(ctx context.Context, options OIDCOptions, token *identity.OIDCTokenResponse) (*identity.OIDCUserInfoClaims, error) {
 	if token == nil || token.AccessToken == "" || strings.ContainsAny(token.AccessToken, " \t\r\n") {
 		return nil, identity.ErrCentralEvidenceInvalid
@@ -79,7 +86,10 @@ func (c *CentralOIDCClient) FetchUserInfo(ctx context.Context, options OIDCOptio
 	return OidcParseUserInfo(string(data), options), nil
 }
 
-// ValidateIDToken loads bounded trusted keys and applies the shared signed-token verifier.
+// ValidateIDToken loads bounded trusted keys and invokes the shared signature,
+// issuer, audience and time verifier. Central authentication also requires the
+// original nonce and a matching authorized party before retaining verified
+// claims.
 func (c *CentralOIDCClient) ValidateIDToken(ctx context.Context, options OIDCOptions, token, nonce string) (*identity.OIDCVerifiedClaims, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, options.JWKSURL, nil)
 	if err != nil {
@@ -100,8 +110,10 @@ func (c *CentralOIDCClient) ValidateIDToken(ctx context.Context, options OIDCOpt
 	return oidcVerifiedClaims(claims), nil
 }
 
-// read consumes one small successful JSON response and discards sensitive diagnostics.
-// Cancellation and provider outages remain unavailable; protocol rejection is not retryable login state.
+// read consumes one bounded successful JSON response and discards sensitive
+// diagnostics. Cancellation and provider outages remain unavailable, while
+// redirects and protocol rejection fail authentication without forwarding
+// credentials to a different endpoint.
 func (c *CentralOIDCClient) read(request *http.Request) ([]byte, error) {
 	request.Header.Set("Accept", "application/json")
 	response, err := c.http.Do(request)

@@ -28,6 +28,8 @@ import (
 // session. Workload status reads can invalidate this issued session but cannot
 // renew its proof, counters or absolute authentication horizon.
 
+// These intents preserve the caller's explicit account operation throughout the
+// browser transaction; the migration profile remains separately enabled in TEST.
 const (
 	CentralIntentLogin        = "login"                 // existing central account sign-in
 	CentralIntentRegister     = "register"              // explicit new local registration
@@ -35,6 +37,8 @@ const (
 	CentralTestBindingProfile = "test-password-totp-v1" // unqualified default-off migration candidate
 )
 
+// These local outcomes distinguish an absent product binding from a migration
+// profile that has not been enabled by the deployment.
 var (
 	ErrCentralNotBound        = errors.New("central account has no local binding")
 	ErrCentralBindingDisabled = errors.New("central account migration is unavailable")
@@ -105,28 +109,48 @@ type CentralLoginCommit struct {
 // CentralSessionStore owns transactional binding, session and status persistence.
 type CentralSessionStore interface {
 	// SaveLogin records an encrypted browser transaction with its original expiry.
-	// Duplicate state digests fail instead of replacing another active flow.
+	// Duplicate state digests fail instead of replacing another active flow, and
+	// no raw browser credential becomes a persistence lookup key.
 	SaveLogin(context.Context, CentralLoginTransaction) error
 	// ConsumeLogin claims the browser-bound state once before any provider exchange.
-	// Expired or previously consumed state cannot be restored after later failure.
+	// Expired or previously consumed state remains unusable, including when a
+	// later exchange or local account commit fails.
 	ConsumeLogin(context.Context, string, string, time.Time) (CentralLoginTransaction, error)
-	// RecordAccountStatus commits observations for a previously bound account
-	// independently of later login success. Unknown local bindings are left absent.
+	// RecordAccountStatus commits a coherent observation for a previously bound
+	// account independently of later login success. Unknown local bindings stay
+	// absent, since status publication cannot acquire an account. Implementations
+	// preserve already observed revision, epoch and attachment fences under
+	// concurrent updates. The independent commit ensures a later rejected proof
+	// or ownership conflict cannot erase revocation that this process has already
+	// learned from the authority.
 	RecordAccountStatus(context.Context, CentralStatusEvidence) error
-	// CompleteLogin atomically preserves local ownership, activates the sticky
-	// human-auth fence and inserts the session after rechecking current evidence.
+	// CompleteLogin commits local ownership, the sticky human-authentication fence
+	// and the new session together after rechecking current evidence. Existing
+	// bindings retain their local owner without repeating registration grants.
+	// New registration must not adopt an account by matching its email, and TEST
+	// migration must verify unchanged prior-owner proof at the persistence
+	// boundary. Any failed local write rolls back account creation and required
+	// registration artifacts before a browser credential can be returned.
 	CompleteLogin(context.Context, CentralLoginCompletion) (CentralLoginCommit, error)
 	// ReadSession loads immutable issued facts before the authority status call.
-	// This snapshot alone cannot authorize a request or override later logout.
+	// This preliminary snapshot alone cannot authorize a request or override
+	// logout that commits before the later authoritative admission read.
 	ReadSession(context.Context, string) (CentralSession, error)
-	// PublishAndRead serializes monotone status publication and reloads the session
-	// with current revocation and local account state before request admission.
+	// PublishAndRead serializes monotone authority status and reloads the original
+	// session with current local account and revocation state. Its result must
+	// retain a logout that completed while the caller fetched remote evidence.
+	// Publication cannot rebase issued counters or extend proof deadlines. A
+	// logical session rejection still preserves newly observed security fences;
+	// storage failure instead denies admission without selecting stale evidence
+	// or another authentication method.
 	PublishAndRead(context.Context, string, CentralStatusEvidence) (CentralSession, CentralStatusEvidence, *User, error)
 	// RevokeSession persists local logout before the browser reports its success.
-	// Repeated revocation is harmless; storage failure remains an explicit error.
+	// Repeated revocation is harmless and preserves the first timestamp; storage
+	// failure remains an explicit error instead of a successful browser logout.
 	RevokeSession(context.Context, string, time.Time) error
 	// RevokeUserSessions invalidates local human sessions for the supplied owner.
-	// It does not revoke product API keys or change financial resource ownership.
+	// It leaves future authentication to a new login flow and does not revoke
+	// product API keys or change financial resource ownership.
 	RevokeUserSessions(context.Context, int64, time.Time) error
 }
 
@@ -164,9 +188,13 @@ type CentralAuthenticated struct {
 	RequestStartedAt time.Time             // original status request start
 }
 
-// Begin creates a one-use encrypted OAuth transaction for an explicit intent.
-// Provider hints come from the configured alias allowlist and cannot redirect
-// credentials to browser-selected endpoints or substitute another issuer.
+// Begin creates a one-use encrypted OAuth transaction for an explicit login,
+// registration or enabled TEST binding intent. It accepts provider hints only
+// from the configured alias allowlist; browser input cannot select an
+// endpoint, client or issuer. Independent random values bind callback state,
+// browser possession, nonce and PKCE. The encrypted intent is saved before
+// returning the provider URL and browser secret, and a binding request forces
+// a new provider authentication ceremony.
 func (f *CentralFlow) Begin(ctx context.Context, intent, provider, invitation string, owner *CentralOwnerProof) (CentralBeginResult, error) {
 	if intent != CentralIntentLogin && intent != CentralIntentRegister && intent != CentralIntentBind {
 		return CentralBeginResult{}, ErrCentralEvidenceInvalid
@@ -242,9 +270,18 @@ func (f *CentralFlow) Begin(ctx context.Context, intent, provider, invitation st
 	return CentralBeginResult{AuthorizationURL: authorize.String(), BrowserSecret: browser, ExpiresAt: transaction.ExpiresAt}, nil
 }
 
-// Finish consumes browser state before exchanging the single-use provider code.
-// A later failure requires a new browser flow. Fresh central evidence and local
-// ownership commit together before the result exposes any product cookie value.
+// Finish consumes the original browser-bound transaction before exchanging its
+// single-use provider code. Any subsequent failure requires a new browser
+// flow, including failed local registration or unavailable authority evidence.
+// Userinfo must match the signed ID-token subject, and ordinary admission must
+// retain the verified authentication time.
+//
+// Known-account status is committed before later proof or ownership failures
+// can discard a newly observed fence. The local ownership and session
+// transaction then succeeds before any cookie is returned. Its deadline is
+// bounded by the local horizon, authority admission and signed ID-token
+// expiry; optional post-registration work retains the existing account service
+// behavior.
 func (f *CentralFlow) Finish(ctx context.Context, state, browser, code string) (CentralFinishResult, error) {
 	if !centralSecret(state) || !centralSecret(browser) || code == "" || len(code) > 8192 {
 		return CentralFinishResult{}, ErrCentralSessionExpired
@@ -341,9 +378,14 @@ func (f *CentralFlow) Finish(ctx context.Context, state, browser, code string) (
 	return CentralFinishResult{Secret: secret, Session: committed.Session}, nil
 }
 
-// Authenticate publishes a fresh status observation before reloading the local
-// session and account. Unavailable status, completed logout and changed issued
-// counters reject the request without falling back to legacy authentication.
+// Authenticate obtains fresh authority status before authorizing an opaque
+// local session. The first store read selects the original account reference
+// and rejects already expired or revoked evidence, but does not itself grant
+// access. Publication then reloads local session and account state, so logout
+// committed during the authority request remains effective. The resulting
+// observation can invalidate original counters and proof bounds; it cannot
+// replace them, extend the session or select legacy authentication during an
+// outage.
 func (f *CentralFlow) Authenticate(ctx context.Context, secret string) (CentralAuthenticated, error) {
 	if !centralSecret(secret) {
 		return CentralAuthenticated{}, ErrCentralSessionExpired
@@ -377,9 +419,13 @@ func (f *CentralFlow) Authenticate(ctx context.Context, secret string) (CentralA
 	return CentralAuthenticated{User: user, Session: session, Status: status, RequestStartedAt: started}, nil
 }
 
-// VerifyLegacyOwner admits only the explicit test migration candidate and
-// requires a current password plus the already configured local TOTP factor.
-// Credential state is checked again after proof and inside the binding commit.
+// VerifyLegacyOwner checks a current password and an already enrolled local
+// TOTP factor for the explicitly enabled TEST migration profile. It captures
+// the credential fingerprint before verifying the factor, then reloads the
+// account to detect changes during verification. The returned proof identifies
+// the original local owner and expires with the browser transaction; the store
+// checks those credential facts again under its user lock. This candidate does
+// not admit a production recovery or migration policy.
 func (f *CentralFlow) VerifyLegacyOwner(ctx context.Context, userID int64, password, code string) (*CentralOwnerProof, error) {
 	if f.Options.TestBindingProfile != CentralTestBindingProfile || f.TOTP == nil {
 		return nil, ErrCentralBindingDisabled
@@ -399,9 +445,14 @@ func (f *CentralFlow) VerifyLegacyOwner(ctx context.Context, userID int64, passw
 	return &CentralOwnerProof{LocalUserID: userID, CredentialFingerprint: fingerprint, VerifiedAt: f.now()}, nil
 }
 
-// prepareRegistration applies existing creation rules without resolving ownership
-// by email. A matching mailbox remains a conflict handled by the atomic store;
-// only a separate admitted binding ceremony can adopt an existing local account.
+// prepareRegistration applies existing registration policy to an explicit new-
+// account intent without looking up ownership by email. Verified provider
+// email follows the ordinary email rules; absent verified email requires the
+// configured policy to allow a synthetic address derived from the central
+// account reference. Invitation rules and signup defaults remain local. This
+// method prepares account data only; the store must commit account creation
+// with the central binding and session, and an existing mailbox remains a
+// conflict.
 func (f *CentralFlow) prepareRegistration(ctx context.Context, intent CentralLoginIntent, claims *OIDCVerifiedClaims, info *OIDCUserInfoClaims, account CentralAccountReference) (*User, *AuthRegistrationArtifacts, AuthSignupGrantPlan, error) {
 	if f.Auth.Settings == nil || !f.Auth.Settings.IsRegistrationEnabled(ctx) {
 		return nil, nil, AuthSignupGrantPlan{}, ErrRegDisabled
@@ -461,8 +512,13 @@ func (f *CentralFlow) prepareRegistration(ctx context.Context, intent CentralLog
 	return user, artifacts, plan, nil
 }
 
-// CentralOwnerFingerprint binds test migration proof to current credential state.
-// Password reset, mailbox change, TOTP replacement or enrollment changes invalidate it.
+// CentralOwnerFingerprint hashes the current credential state used by the TEST
+// migration proof. It includes the full password hash and normalized email
+// alongside the resolved credential version, exact encrypted TOTP value,
+// enrollment flag and timestamp. Keeping the complete inputs avoids relying
+// solely on a truncated legacy revision when a later transaction compares
+// ownership evidence. The result contains no recoverable credential fields; a
+// serialization failure returns an empty sentinel instead of a partial digest.
 func CentralOwnerFingerprint(user *User) string {
 	data, err := json.Marshal(struct {
 		Version      int64      // existing resolved credential revision
@@ -478,21 +534,25 @@ func CentralOwnerFingerprint(user *User) string {
 	return CentralSecretDigest(string(data))
 }
 
-// CentralSecretDigest creates the durable lookup value for an opaque browser secret.
-// Raw cookie and transaction values remain outside persistence and diagnostic text.
+// CentralSecretDigest creates the durable SHA-256 lookup value for an opaque
+// browser secret. Callers retain raw cookie and transaction values only for
+// their immediate browser or provider exchange.
 func CentralSecretDigest(secret string) string {
 	digest := sha256.Sum256([]byte(secret))
 	return hex.EncodeToString(digest[:])
 }
 
-// CentralCSRFMatches compares independent request proof with its authenticated session.
-// The proof is useful only alongside the opaque HttpOnly product session cookie.
+// CentralCSRFMatches compares independently supplied request proof with its
+// authenticated session in constant time. The proof is accepted only in the
+// fixed random representation and cannot authenticate without the HttpOnly
+// cookie.
 func CentralCSRFMatches(session CentralSession, supplied string) bool {
 	return centralSecret(supplied) && subtle.ConstantTimeCompare([]byte(session.CSRFSecret), []byte(supplied)) == 1
 }
 
-// centralSecret admits only the fixed random representation produced for browser flows.
-// It bounds cookie input before hashing or performing a persistence lookup.
+// centralSecret accepts only the fixed hexadecimal representation generated
+// for browser flows. Validation bounds untrusted cookie or callback input
+// before hashing, persistence lookup, or any comparison against stored proof.
 func centralSecret(value string) bool {
 	if len(value) != 64 {
 		return false
@@ -501,9 +561,11 @@ func centralSecret(value string) bool {
 	return err == nil
 }
 
-// now returns the injected clock in UTC for persistent authentication observations.
-// A missing clock uses wall time without extending stored evidence or deadlines.
+// now returns the injected clock, or wall time when absent, in UTC at
+// PostgreSQL microsecond precision. Normalizing before serialization keeps
+// exact comparisons between JSON evidence and timestamp columns meaningful.
 func (f *CentralFlow) now() time.Time {
+	// Match timestamp-column precision before encoding evidence for exact comparisons.
 	if f.Now != nil {
 		return f.Now().UTC().Truncate(time.Microsecond)
 	}

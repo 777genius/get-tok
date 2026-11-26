@@ -75,8 +75,9 @@ Google One Tap 是 Google 登录在浏览器端的另一个凭据入口，身份
 
 1. 只接受配置的 HMAC 签名方法，限制 token 长度，解析签发时间和过期时间。
 2. 从数据库读取当前用户，用户不存在、已删除或未启用时拒绝。
-3. 比较声明里的 `token_version` 和 `ResolvedTokenVersion` 得到的当前凭据指纹。指纹由规范化后的邮箱和 `password_hash` 推导；声明与当前指纹不一致时拒绝。
-4. 开启会话绑定时，校验 JWT 的客户端绑定摘要 `bnd`，然后把当前用户 ID、邮箱和角色写入 Gin 上下文。
+3. 当前用户为 `central_managed` 时拒绝旧 JWT；判断使用本次数据库读取，不依赖历史登录或缓存快照。账户绑定后，旧 human 凭据不能重新进入 legacy 登录路径。
+4. 比较声明里的 `token_version` 和 `ResolvedTokenVersion` 得到的当前凭据指纹。指纹由规范化后的邮箱和 `password_hash` 推导；声明与当前指纹不一致时拒绝。
+5. 开启会话绑定时，校验 JWT 的客户端绑定摘要 `bnd`，然后把当前用户 ID、邮箱和角色写入 Gin 上下文。
 
 管理员路由接受两种凭据，能力不完全相同。管理员 JWT 照常检查用户状态和 token version。`x-api-key` 管理密钥代表配置里的第一个实际管理员账户。敏感设置开启 step-up 后，管理密钥无法通过二次验证，需要使用带有效 `sid` 的管理员 JWT。WebSocket 场景可以从约定的子协议里读取 JWT，同样检查当前用户。
 

@@ -43,7 +43,7 @@ import (
 	"github.com/TokenFlux/TokenRouter/internal/web"
 )
 
-// identity_central_native_integration_test.go joins the production GetTok BFF
+// identity_central_integration_test.go joins the production GetTok BFF
 // with a real Identity HTTP server, Keycloak authorization-code flow and migrated
 // PostgreSQL storage. The explicitly selected native_identity tag requires all
 // native dependencies; absent configuration fails instead of silently reducing
@@ -74,7 +74,13 @@ type centralNativeOutput struct {
 	exceeded bool   // whether any child output exceeded the report limit
 }
 
-// Write retains at most eight KiB and acknowledges remaining bytes without buffering them.
+// Write retains at most eight KiB while acknowledging every input byte to the
+// child's output pipe. Returning the original length allows the process to
+// finish even after the retained report limit is exceeded, instead of blocking
+// cancellation on an unread stream. The exceeded flag prevents that truncated
+// prefix from being accepted as a complete success report. Callers inspect
+// only validated fields and never copy arbitrary retained diagnostics into
+// test logs.
 func (o *centralNativeOutput) Write(data []byte) (int, error) {
 	remaining := max(0, 8192-len(o.data))
 	o.data = append(o.data, data[:min(remaining, len(data))]...)
@@ -82,8 +88,10 @@ func (o *centralNativeOutput) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-// TestCentralNativeBFFCookieFlow runs an actual callback, browser and revocation chain.
-// Use integration,native_identity,embed together after building the real frontend.
+// TestCentralNativeBFFCookieFlow runs a real callback, browser, local
+// ownership and revocation chain. It requires
+// integration,native_identity,embed after building the frontend and rejects
+// absent native dependencies instead of skipping qualification.
 func TestCentralNativeBFFCookieFlow(t *testing.T) {
 	t.Log(`{"nativeGetTokStage":"setup"}`)
 	require.True(t, web.HasEmbeddedFrontend(), "native browser qualification requires the embed build tag and real frontend dist")
@@ -128,9 +136,11 @@ func TestCentralNativeBFFCookieFlow(t *testing.T) {
 	require.NoError(t, err)
 	cipher, err := cryptoinfra.NewAESEncryptor(key)
 	require.NoError(t, err)
-	central := provideCentralIdentity(cfg, db, graph, users, authSettings, nil, cipher)
 	store := settings.New(repository)
+	backend := provideBackendMode(store)
+	central := provideCentralIdentity(cfg, db, graph, users, authSettings, backend, nil, cipher)
 	public := provideSitePublic(store, provideOAuthSettings(store, cfg), cfg, timezone.NewCalendar(time.UTC))
+	runtime := identityHTTPSettings{identityAuthSettings: authSettings, BackendMode: backend, public: public}
 	publicHTTP := provideSitePublicHTTP(public, BuildInfo{Version: "native-identity-test"})
 	frontend, err := web.NewFrontendServer(public)
 	require.NoError(t, err)
@@ -141,12 +151,12 @@ func TestCentralNativeBFFCookieFlow(t *testing.T) {
 	// The native fixture selects disabled anonymous challenge/rate policy only;
 	// every Identity, provider, ownership and cookie operation is the real adapter.
 	pass := func(c *gin.Context) { c.Next() }
-	guards := identityhttp.AuthRouteMiddleware{Audit: pass, BackendAuth: identityhttp.BackendModeAuthGuard(authSettings), Limit: func(string, int, time.Duration) gin.HandlerFunc { return pass }}
+	guards := identityhttp.AuthRouteMiddleware{Audit: pass, BackendAuth: identityhttp.BackendModeAuthGuard(backend), Limit: func(string, int, time.Duration) gin.HandlerFunc { return pass }}
 	identityhttp.RegisterCentralAuthenticationRoutes(v1, central, guards)
 	v1.GET("/settings/public", publicHTTP.GetPublicSettings)
-	sessions := identityhttp.NewSessionHandler(graph.Core, users, authSettings, nil, nil, nil, identityhttp.SessionHTTPOptions{})
+	sessions := identityhttp.NewSessionHandler(graph.Core, users, runtime, nil, nil, nil, identityhttp.SessionHTTPOptions{BackendMode: runtime.ReadBackendMode})
 	legacy := identityhttp.JWTAuth(graph.Core, users, users, authSettings, nil)
-	v1.GET("/auth/me", central.Wrap(legacy, false), identityhttp.BackendModeUserGuard(authSettings), sessions.GetCurrentUser)
+	v1.GET("/auth/me", central.Wrap(legacy, false), identityhttp.BackendModeUserGuard(backend), sessions.GetCurrentUser)
 	v1.POST("/auth/logout", central.Logout)
 	listener, err := net.Listen("tcp", origin.Host)
 	require.NoError(t, err)
@@ -244,8 +254,14 @@ func TestCentralNativeBFFCookieFlow(t *testing.T) {
 	t.Log("native GetTok BFF, browser, Keycloak, Identity HTTP, ownership preservation and suspension checks passed")
 }
 
-// centralNativeLogin follows only the configured native issuer and BFF redirect.
-// The first request may display Keycloak credentials; later requests reuse its cookie.
+// centralNativeLogin follows the configured native issuer and exact BFF
+// callback using the real cookie jar. The first flow can submit the synthetic
+// Keycloak credentials, while later flows reuse its provider session. Every
+// response is handled explicitly within a finite redirect budget, so an
+// unexpected destination cannot receive those credentials. The final frontend
+// callback must have the exact configured origin and path, no credentials or
+// fragment, and either no query or one expected public error. Successful flows
+// also require the real HttpOnly cookie without logging provider URLs or payloads.
 func centralNativeLogin(t *testing.T, client *http.Client, origin, issuer *url.URL, intent, expectedError string) {
 	t.Helper()
 	response, body := centralNativeRequest(t, client, http.MethodPost, origin.String()+"/api/v1/auth/central/start", `{"intent":"`+intent+`"}`, origin.String(), "")
@@ -273,8 +289,14 @@ func centralNativeLogin(t *testing.T, client *http.Client, origin, issuer *url.U
 		destination, err := response.Location()
 		require.True(t, err == nil, "native redirect must have a valid location; diagnostic URL is withheld")
 		if destination.Host == origin.Host && destination.Path == "/auth/central/callback" {
-			require.Equal(t, expectedError, destination.Query().Get("error"))
-			require.LessOrEqual(t, len(destination.Query()), 1, "frontend callback must not receive OAuth credentials")
+			require.True(t, destination.Scheme == origin.Scheme && destination.User == nil && destination.Opaque == "" && destination.RawPath == "" && destination.Fragment == "" && destination.RawFragment == "", "frontend callback must have the exact origin and path without userinfo or a fragment")
+			if expectedError == "" {
+				require.True(t, destination.RawQuery == "" && !destination.ForceQuery, "successful frontend callback must not receive query data")
+			} else {
+				query, parseErr := url.ParseQuery(destination.RawQuery)
+				errorValues := query["error"]
+				require.True(t, parseErr == nil && len(query) == 1 && len(errorValues) == 1 && errorValues[0] == expectedError && !destination.ForceQuery, "failed frontend callback must contain exactly its expected public error")
+			}
 			if expectedError == "" {
 				found := false
 				for _, cookie := range response.Cookies() {
@@ -297,8 +319,10 @@ func centralNativeLogin(t *testing.T, client *http.Client, origin, issuer *url.U
 	t.Fatal("native authorization exceeded its finite redirect budget")
 }
 
-// centralNativeRequest performs one bounded real request without automatic redirect following.
-// It avoids logging provider payloads, codes, cookies or user credentials on failure.
+// centralNativeRequest performs one bounded real request using a client with
+// automatic redirects disabled. It closes the response body and reports fixed
+// failure messages so transport errors cannot disclose provider URLs, codes or
+// cookies.
 func centralNativeRequest(t *testing.T, client *http.Client, method, address, payload, origin, csrf string) (*http.Response, []byte) {
 	t.Helper()
 	request, err := http.NewRequestWithContext(t.Context(), method, address, strings.NewReader(payload))
@@ -324,7 +348,10 @@ func centralNativeRequest(t *testing.T, client *http.Client, method, address, pa
 	return response, body
 }
 
-// centralNativeDecode reads the browser envelope and rejects provider credential fields.
+// centralNativeDecode validates a successful browser envelope and decodes its
+// data into the supplied target. Provider credential fields are rejected
+// before parsing the projection, preserving the BFF's browser custody
+// boundary.
 func centralNativeDecode(t *testing.T, body []byte, target any) {
 	t.Helper()
 	for _, forbidden := range [][]byte{[]byte(`"access_token"`), []byte(`"refresh_token"`), []byte(`"id_token"`)} {
@@ -396,7 +423,9 @@ func centralNativeCommand(t *testing.T, name string, trailing ...string) {
 	t.Log(`{"nativeGetTokLifecycle":"committed"}`)
 }
 
-// centralNativeRequired makes native qualification fail explicitly when a dependency is absent.
+// centralNativeRequired reads one explicit native runner setting and fails
+// when it is absent. The diagnostic names the setting only, keeping its value
+// outside test logs and preventing silently skipped qualification.
 func centralNativeRequired(t *testing.T, name string) string {
 	t.Helper()
 	value := strings.TrimSpace(os.Getenv(name))
@@ -404,7 +433,9 @@ func centralNativeRequired(t *testing.T, name string) string {
 	return value
 }
 
-// centralNativeLoopbackURL confines TEST configuration to actual local HTTP authorities.
+// centralNativeLoopbackURL validates an explicit native HTTP authority with an
+// IPv4 loopback host and port. User information, query overrides and fragments
+// are rejected before the fixture uses that endpoint.
 func centralNativeLoopbackURL(t *testing.T, name string) *url.URL {
 	t.Helper()
 	u, err := url.Parse(centralNativeRequired(t, name))

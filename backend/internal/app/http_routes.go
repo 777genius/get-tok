@@ -36,7 +36,7 @@ import (
 type httpRouteSecurity struct {
 	// JWT, Admin, Audit, StepUp, BackendAuth, and BackendUser are supplied
 	// once by router assembly. Each route family chooses the guards and their execution order.
-	// JWT: panel bearer authentication.
+	// JWT: central-cookie or legacy panel authentication.
 	// Admin: administrator access authentication.
 	// Audit: panel activity recording.
 	// StepUp: sensitive action verification.

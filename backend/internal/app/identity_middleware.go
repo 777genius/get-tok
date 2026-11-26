@@ -29,13 +29,19 @@ func (a identityAuthAudit) RecordBindingMismatch(_ context.Context, event identi
 	a.audit.Record(&audit.AuditLog{ActorUserID: &event.UserID, ActorEmail: event.Email, ActorRole: event.Role, AuthMethod: audit.AuditAuthMethodJWT, Action: audit.AuditActionSessionBindingMismatch, Method: event.Method, Path: event.Path, ClientIP: event.ClientIP, UserAgent: event.UserAgent, StatusCode: 401})
 }
 
-// provideJWTAuth binds identity, settings, and activity recording to JWT middleware.
+// provideJWTAuth admits either an explicitly bound central browser session or
+// legacy panel credentials. The central wrapper preserves ordinary product
+// authorization, while legacy validation reads the durable central-management
+// fence before accepting an older local token.
 func provideJWTAuth(graph *identityAuthGraph, users *identity.UserService, settings *identity.RuntimeSettings, recorder *audit.AuditLogService, central *identityhttp.CentralHandler) identityhttp.JWTAuthMiddleware {
 	legacy := identityhttp.JWTAuth(graph.Core, users, users, settings, identityAuthAudit{recorder})
 	return identityhttp.JWTAuthMiddleware(central.Wrap(legacy, false))
 }
 
-// provideAdminAuth constructs administrator authentication with shared identity services and audit recording.
+// provideAdminAuth composes human administrator authentication with central
+// assurance and existing role checks. MCP administrator credentials retain their
+// separate machine policy outside the human session wrapper and do not acquire
+// a browser continuity proof.
 func provideAdminAuth(graph *identityAuthGraph, users *identity.UserService, settings *identity.RuntimeSettings, recorder *audit.AuditLogService, tokens *identity.MCPTokenService, central *identityhttp.CentralHandler) identityhttp.AdminAuthMiddleware {
 	normal := central.Wrap(identityhttp.AdminAuth(graph.Core, users, settings, identityAuthAudit{recorder}), true)
 	return identityhttp.AdminAuthMiddleware(identityhttp.MCPAdminAuth(tokens, normal))

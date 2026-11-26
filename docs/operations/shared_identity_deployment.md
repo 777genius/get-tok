@@ -46,4 +46,6 @@ Identity、Keycloak 或网络故障时，不使用旧的 ACTIVE 观察继续放�
 
 原生 join 使用 `TestCentralNativeBFFCookieFlow`，构建标签为 `integration,native_identity,embed`。Identity 的 native runner 启动真实 Keycloak 和 Identity HTTP，并传入 loopback TEST 数据库及单独的 browser/lifecycle argv。缺少这些依赖时，测试失败，不跳过。前端使用既有 `make build-frontend` 生成 `backend/internal/web/dist`，由生产 SPA middleware 交付；不使用测试 HTML、伪造 session 接口或手工注入浏览器 cookie。
 
+持续验证由 [Shared Identity E2E workflow](../../.github/workflows/shared-identity-e2e.yml) 运行，authority checkout 固定到明确的 commit，两个仓库各自使用固定工具链。在 Identity checkout 中执行 `pnpm test:native-gettok`；consumer 配置使用 `GETTOK_NATIVE_REPOSITORY`、`GETTOK_NATIVE_GO`、`GETTOK_NATIVE_BROWSER_COMMAND` 和 `GETTOK_NATIVE_DATABASE_URL`，同时提供 workflow 列出的独立 PostgreSQL、Keycloak 和 TEST client 参数。launcher 先从实际 consumer 源码编译 Go fixture，再启动 Keycloak；预编译 binary 路径由 launcher 自己管理，不接受外部替代。
+
 完整链路包括未绑定 login 拒绝、显式注册、真实浏览器点击进入 Keycloak、callback、刷新页面、CSRF 拒绝、本地 logout，以及 production Identity lifecycle suspend 后原 cookie 被拒绝。Go 测试只输出有界 stage/result JSON；浏览器和 lifecycle 子进程有超时和退出处理。这个链路通过与否以对应 exact commit 的实际执行结果为准，编译、fixture 代码或 provider-only 测试不能替代 joined E2E 的结果。

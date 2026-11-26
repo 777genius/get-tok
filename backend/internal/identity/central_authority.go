@@ -18,9 +18,11 @@ import "context"
 // CentralIdentityAuthority resolves humans and reads previously attached account status.
 type CentralIdentityAuthority interface {
 	// ResolveSelf derives subject and consumer from a live human credential.
-	// The command key provides retry identity without selecting any account.
+	// Its command key identifies retries of that authenticated operation without
+	// accepting browser-selected account ownership or replacing proof with status.
 	ResolveSelf(ctx context.Context, humanCredential, commandID string) (CentralResolution, error)
-	// GetAccountStatus uses separate workload authority for read-only status.
-	// It cannot renew the admission proof frozen into a product session.
+	// GetAccountStatus uses separate workload authority for read-only status of
+	// an already attached account. It cannot create a binding, impersonate its
+	// owner, or renew admission frozen into a product session.
 	GetAccountStatus(ctx context.Context, account CentralAccountReference) (CentralStatusEvidence, error)
 }

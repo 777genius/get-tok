@@ -35,8 +35,10 @@ type CentralSessionStore struct {
 	now    func() time.Time // current persistence observation clock
 }
 
-// NewCentralSessionStore retains matching SQL and Ent clients for atomic writes.
-// The existing authentication state must use those same clients and participants.
+// NewCentralSessionStore retains matching SQL and Ent clients for atomic
+// account and session writes. Authentication state must share those
+// participants; a nil clock selects wall time for subsequent persistence
+// observations.
 func NewCentralSessionStore(db *sql.DB, client *dbent.Client, auth *AuthState, now func() time.Time) *CentralSessionStore {
 	if now == nil {
 		now = time.Now
@@ -44,10 +46,13 @@ func NewCentralSessionStore(db *sql.DB, client *dbent.Client, auth *AuthState, n
 	return &CentralSessionStore{db: db, client: client, auth: auth, now: now}
 }
 
-// SaveLogin stores a bounded encrypted browser intent without any plaintext PKCE.
-// A duplicate random state is an error and never replaces an earlier flow. Each
-// start also removes at most one hundred long-expired intents and sessions;
-// retained bindings and sticky account fences are never cleanup candidates.
+// SaveLogin stores a bounded encrypted browser intent without retaining
+// plaintext PKCE or nonce values in lookup columns. A duplicate state is an
+// error rather than replacement of an earlier flow. The same statement removes
+// at most one hundred long-expired intents and sessions, skipping rows held by
+// other transactions. Cleanup uses separate retention windows and never
+// removes bindings or the sticky user fence; an expired record cannot regain
+// admission while awaiting later cleanup.
 func (s *CentralSessionStore) SaveLogin(ctx context.Context, flow identity.CentralLoginTransaction) error {
 	_, err := s.db.ExecContext(ctx, `WITH expired_intents AS (
  DELETE FROM central_identity_login_transactions WHERE state_hash IN (
@@ -68,8 +73,10 @@ INSERT INTO central_identity_login_transactions
 	return centralStoreError(err)
 }
 
-// ConsumeLogin claims only the original browser's unused and unexpired state.
-// The committed update precedes code exchange; later failures cannot replay it.
+// ConsumeLogin atomically claims only the original browser's unused, unexpired
+// transaction. The committed update precedes provider exchange, so a later
+// failure cannot restore consumed state or replay the same authorization
+// response.
 func (s *CentralSessionStore) ConsumeLogin(ctx context.Context, state, browser string, now time.Time) (identity.CentralLoginTransaction, error) {
 	flow := identity.CentralLoginTransaction{StateDigest: state, BrowserDigest: browser}
 	err := s.db.QueryRowContext(ctx, `UPDATE central_identity_login_transactions SET consumed_at=$3
@@ -201,15 +208,21 @@ func (s *CentralSessionStore) CompleteLogin(ctx context.Context, input identity.
 	return identity.CentralLoginCommit{User: user, Session: session, Created: created}, nil
 }
 
-// ReadSession loads issued evidence and the independent local revocation column.
-// Callers must publish fresh authority status before admitting this snapshot.
+// ReadSession loads original issued evidence together with the independent
+// local revocation column. Callers must publish fresh authority status and
+// reload current state before treating this preliminary snapshot as request
+// admission.
 func (s *CentralSessionStore) ReadSession(ctx context.Context, digest string) (identity.CentralSession, error) {
 	return centralReadSession(ctx, s.db, digest, false)
 }
 
-// RecordAccountStatus commits known-account fences separately from login completion.
-// Rejected proof, local ownership conflicts or signup failure cannot discard a
-// newer revocation observation. Unknown local bindings are never created here.
+// RecordAccountStatus publishes an observation for an already bound account in
+// its own transaction. It locks the binding before merging revisions and
+// counters so a delayed callback cannot overwrite a newer denial. Unknown
+// accounts remain unbound rather than acquiring ownership through a read.
+// Successful publication commits before later proof or registration checks;
+// rejection in those independent steps therefore cannot roll back a security
+// fence that this process has already observed.
 func (s *CentralSessionStore) RecordAccountStatus(ctx context.Context, incoming identity.CentralStatusEvidence) error {
 	tx, err := s.client.Tx(ctx)
 	if err != nil {
@@ -243,9 +256,14 @@ func (s *CentralSessionStore) RecordAccountStatus(ctx context.Context, incoming 
 	return centralStoreError(tx.Commit())
 }
 
-// PublishAndRead merges status under the binding lock before reading the session.
-// Every path uses binding-before-session lock order, and logout never acquires
-// a binding lock after changing a session, preventing lock-order inversion.
+// PublishAndRead merges current authority status under the binding lock before
+// reloading the original session and local account. Binding-before-session
+// lock order is shared with other publication paths, while logout never
+// acquires a binding lock after a session lock. The transaction commits the
+// observation even when concurrent cleanup or a logical session mismatch
+// prevents admission. Callers then evaluate the returned original proof
+// against those current facts, including any local revocation that completed
+// during the authority request.
 func (s *CentralSessionStore) PublishAndRead(ctx context.Context, digest string, incoming identity.CentralStatusEvidence) (identity.CentralSession, identity.CentralStatusEvidence, *identity.User, error) {
 	tx, err := s.client.Tx(ctx)
 	if err != nil {
@@ -303,15 +321,22 @@ func (s *CentralSessionStore) RevokeSession(ctx context.Context, digest string, 
 	return centralStoreError(err)
 }
 
-// RevokeUserSessions revokes all local human sessions owned by the selected user.
-// Machine keys and central account lifecycle are outside this local logout operation.
+// RevokeUserSessions persists logout for existing local human sessions owned
+// by the selected user. Machine credentials, future logins and central
+// lifecycle remain separate; repeated withdrawal preserves each session's
+// first revocation timestamp.
 func (s *CentralSessionStore) RevokeUserSessions(ctx context.Context, userID int64, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE central_identity_sessions SET revoked_at=COALESCE(revoked_at,$2) WHERE local_user_id=$1`, userID, now)
 	return centralStoreError(err)
 }
 
-// centralReadSession cross-checks lookup columns against immutable encoded evidence.
-// The revocation column remains independent so logout never rewrites issued proof.
+// centralReadSession checks lookup identity and timestamp columns against the
+// encoded original session before returning it. Callers request a row lock
+// when this read participates in status publication, preventing a completed
+// concurrent logout from being hidden by an earlier snapshot. The independent
+// revocation column overrides only local withdrawal state; it never rewrites
+// proof deadlines or issued counters. Inconsistent encoded evidence fails
+// closed, and missing rows retain the session-expired error category.
 func centralReadSession(ctx context.Context, query SQLExecutor, digest string, locked bool) (identity.CentralSession, error) {
 	statement := `SELECT local_user_id,session_evidence,created_at,expires_at,revoked_at FROM central_identity_sessions WHERE token_hash=$1`
 	if locked {
@@ -335,8 +360,9 @@ func centralReadSession(ctx context.Context, query SQLExecutor, digest string, l
 	return session, nil
 }
 
-// centralPublish writes one already merged authoritative observation in its transaction.
-// It never changes the bound local account or any previously issued session fields.
+// centralPublish writes one already merged authority observation in the
+// supplied transaction. The caller owns the binding lock and commit; this
+// write never changes local ownership or previously issued session evidence.
 func centralPublish(ctx context.Context, query SQLExecutor, userID int64, status identity.CentralStatusEvidence) error {
 	encoded, err := json.Marshal(status)
 	if err != nil {
@@ -346,8 +372,10 @@ func centralPublish(ctx context.Context, query SQLExecutor, userID int64, status
 	return centralStoreError(err)
 }
 
-// centralScan consumes exactly one row from the transaction-aware SQL executor.
-// It retains database errors and closes rows before another statement can run.
+// centralScan consumes exactly one row through the supplied transaction-aware
+// executor. It closes rows before another statement runs, preserves query and
+// scan errors, and rejects unexpected additional records instead of selecting
+// one silently.
 func centralScan(ctx context.Context, query SQLExecutor, statement string, arguments []any, values ...any) error {
 	rows, err := query.QueryContext(ctx, statement, arguments...)
 	if err != nil {
@@ -369,8 +397,10 @@ func centralScan(ctx context.Context, query SQLExecutor, statement string, argum
 	return rows.Err()
 }
 
-// centralStoreError hides SQL diagnostics while retaining actionable authentication categories.
-// Unknown failures are unavailable evidence and cannot permit a legacy fallback.
+// centralStoreError hides database diagnostics while preserving missing-
+// session, uniqueness-conflict and invalid-evidence categories. Any
+// unrecognized persistence failure remains unavailable authentication state
+// and cannot authorize a fallback to old credentials.
 func centralStoreError(err error) error {
 	if err == nil {
 		return nil

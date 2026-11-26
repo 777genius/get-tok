@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/TokenFlux/TokenRouter/internal/config"
+	"github.com/TokenFlux/TokenRouter/internal/gateway/admission"
 	"github.com/TokenFlux/TokenRouter/internal/identity"
 	identityhttp "github.com/TokenFlux/TokenRouter/internal/identity/httpapi"
 	identitypostgres "github.com/TokenFlux/TokenRouter/internal/identity/postgres"
@@ -28,11 +29,14 @@ import (
 // their actual selected resource or restrict queries to personal projections.
 // Existing product role checks and machine credential policies remain separate.
 
-// provideCentralIdentity assembles one startup-pinned BFF or a disabled capability handler.
-// Independent-continuity policy fields remain empty until a native provider profile qualifies.
-func provideCentralIdentity(cfg *config.Config, db *sql.DB, graph *identityAuthGraph, users *identity.UserService, settings *identityAuthSettings, totp *identity.TotpService, cipher identity.SecretEncryptor) *identityhttp.CentralHandler {
+// provideCentralIdentity assembles a startup-pinned BFF or a disabled
+// capability handler using existing account participants. It leaves
+// independent-continuity policy fields unset until the actual mechanism
+// qualifies, preserving stronger resource refusals. Backend admission reads
+// reuse the same published setting cache as the existing panel guards.
+func provideCentralIdentity(cfg *config.Config, db *sql.DB, graph *identityAuthGraph, users *identity.UserService, settings *identityAuthSettings, backend *admission.BackendMode, totp *identity.TotpService, cipher identity.SecretEncryptor) *identityhttp.CentralHandler {
 	c := cfg.CentralIdentity
-	handler := &identityhttp.CentralHandler{Options: identityhttp.CentralHTTPOptions{Origin: c.Origin, ProviderName: c.ProviderName, TestLoopback: c.TestLoopback, Access: centralRouteAccess, BackendMode: settings.IsBackendModeEnabled}, Auth: graph.Core, Users: users, BindingSettings: settings}
+	handler := &identityhttp.CentralHandler{Options: identityhttp.CentralHTTPOptions{Origin: c.Origin, ProviderName: c.ProviderName, TestLoopback: c.TestLoopback, Access: centralRouteAccess, BackendMode: backend.IsBackendModeEnabled}, Auth: graph.Core, Users: users, BindingSettings: settings}
 	if !c.Enabled {
 		return handler
 	}
@@ -46,8 +50,10 @@ func provideCentralIdentity(cfg *config.Config, db *sql.DB, graph *identityAuthG
 	return handler
 }
 
-// centralRouteAccess identifies wholly protected resource families without granting roles.
-// Mixed personal/team resources perform their additional resolved-resource checks downstream.
+// centralRouteAccess classifies wholly protected route families before
+// ordinary product authorization. Mixed personal and team handlers must
+// evaluate their server-selected resource downstream; this classification
+// grants neither local roles nor ownership.
 func centralRouteAccess(_ context.Context, _ int64, route, method string) (identity.CentralAccessClass, error) {
 	if route == "/api/v1/team" || strings.HasPrefix(route, "/api/v1/team/") {
 		if method == http.MethodGet || method == http.MethodHead {

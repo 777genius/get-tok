@@ -49,15 +49,19 @@ type CentralIdentityClient struct {
 	tokenUntil time.Time                               // conservative cache deadline before grant expiration
 }
 
-// NewCentralIdentityClient constructs bounded transports after deployment validation.
-// TLS verification stays enabled; loopback HTTP is admitted only by TEST configuration.
+// NewCentralIdentityClient constructs bounded generated RPC and workload
+// transports after deployment validation. TLS verification stays enabled,
+// redirects are not followed, and loopback HTTP is reserved for the explicit
+// TEST configuration.
 func NewCentralIdentityClient(options CentralAuthorityOptions) *CentralIdentityClient {
 	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return &CentralIdentityClient{options: options, http: client, client: identityv1connect.NewIdentityServiceClient(client, options.BaseURL, connect.WithReadMaxBytes(65536))}
 }
 
-// ResolveSelf sends the verified human access credential only in authenticated metadata.
-// The request body contains command identity; issuer, subject and consumer are server-derived.
+// ResolveSelf sends the live human credential only through authenticated
+// metadata. The versioned request carries its idempotency key while the
+// authority derives issuer, subject and consumer; returned unknown wire values
+// fail closed.
 func (c *CentralIdentityClient) ResolveSelf(ctx context.Context, human, command string) (identity.CentralResolution, error) {
 	request := connect.NewRequest(&identityv1.ResolveSelfRequest{IdempotencyKey: command})
 	request.Header().Set("Authorization", "Bearer "+human)
@@ -73,8 +77,10 @@ func (c *CentralIdentityClient) ResolveSelf(ctx context.Context, human, command 
 	return identity.CentralResolution{Status: status, Admission: admission}, err
 }
 
-// GetAccountStatus uses only the consumer workload credential and exact account reference.
-// The returned evidence never changes the original session counters or proof deadline.
+// GetAccountStatus uses a separate workload credential to read the exact
+// attached account reference. It rejects a contradictory returned reference,
+// and its evidence cannot renew the original session counters or human proof
+// deadline.
 func (c *CentralIdentityClient) GetAccountStatus(ctx context.Context, account identity.CentralAccountReference) (identity.CentralStatusEvidence, error) {
 	credential, err := c.workloadCredential(ctx)
 	if err != nil {
@@ -93,8 +99,13 @@ func (c *CentralIdentityClient) GetAccountStatus(ctx context.Context, account id
 	return status, err
 }
 
-// workloadCredential obtains a dedicated client-credentials grant and caches it briefly.
-// Failed refresh has no fallback to an expired grant or another authentication client.
+// workloadCredential obtains and briefly caches a dedicated client-credentials
+// grant under a mutex shared by callers. Refresh failure never selects an
+// expired token or the human client. The cache deadline starts before the
+// request so network time consumes the existing budget; it is capped at one
+// minute and at least five seconds before reported provider expiry. This
+// deadline governs token transport only and cannot extend account-status
+// evidence or an authenticated browser session.
 func (c *CentralIdentityClient) workloadCredential(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -135,8 +146,10 @@ func (c *CentralIdentityClient) workloadCredential(ctx context.Context) (string,
 	return c.token, nil
 }
 
-// centralStatus converts the generated observation without weakening required fields.
-// Counter and contextual policy validation stays with the core acceptance function.
+// centralStatus converts the generated observation without supplying defaults
+// for absent required messages or unknown enums. The core separately validates
+// consumer, counter presence and contextual time bounds before any request
+// admission.
 func centralStatus(value *identityv1.AccountStatusEvidence) (identity.CentralStatusEvidence, error) {
 	if value == nil || value.Account == nil {
 		return identity.CentralStatusEvidence{}, identity.ErrCentralEvidenceInvalid
@@ -169,8 +182,10 @@ func centralStatus(value *identityv1.AccountStatusEvidence) (identity.CentralSta
 	return status, err
 }
 
-// centralAdmission retains the exact proof profile, policy, provider session and age.
-// Unknown profiles cannot become ordinary evidence through a zero-value conversion.
+// centralAdmission retains the exact qualified profile, policy, provider
+// session and authentication timestamps. Unknown profiles and malformed
+// required fields return errors; configuration, rather than received claims,
+// determines whether a stronger policy is enabled.
 func centralAdmission(value *identityv1.SessionAdmission) (identity.CentralSessionAdmission, error) {
 	if value == nil {
 		return identity.CentralSessionAdmission{}, identity.ErrCentralEvidenceInvalid
@@ -193,7 +208,10 @@ func centralAdmission(value *identityv1.SessionAdmission) (identity.CentralSessi
 	return admission, err
 }
 
-// centralTimestamp rejects malformed wire values; optional omitted cutoffs stay absent.
+// centralTimestamp converts a valid protobuf timestamp to UTC. Required
+// missing values fail, while omitted optional cutoffs remain absent; an
+// explicitly supplied malformed timestamp never becomes an absent or default
+// cutoff.
 func centralTimestamp(value *timestamppb.Timestamp, required bool) (time.Time, error) {
 	if value == nil {
 		if required {
@@ -207,8 +225,10 @@ func centralTimestamp(value *timestamppb.Timestamp, required bool) (time.Time, e
 	return value.AsTime().UTC(), nil
 }
 
-// centralRPCError maps only recognized protocol semantics without retaining diagnostics.
-// Unknown details and authentication failures deny use; infrastructure errors remain unavailable.
+// centralRPCError converts recognized protocol semantics to stable local
+// authentication errors without retaining server diagnostics. Explicit service
+// failures remain unavailable, while rejected or unknown authentication
+// evidence cannot grant access or trigger a legacy fallback.
 func centralRPCError(err error) error {
 	if connect.CodeOf(err) == connect.CodeUnavailable || connect.CodeOf(err) == connect.CodeDeadlineExceeded || connect.CodeOf(err) == connect.CodeResourceExhausted || connect.CodeOf(err) == connect.CodeInternal {
 		return identity.ErrCentralUnavailable

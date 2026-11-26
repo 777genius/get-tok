@@ -77,14 +77,14 @@ RequestLogger
 | `/health`、`/setup/status` | 无 | `server/router.go`；进程健康检查和正常模式下的 setup 状态 |
 | `/api/event_logging/batch` | 无 | 兼容 Claude Code 遥测的空接收端，固定返回成功 |
 | `/api/v1/auth/*` | 大多公开，账户管理的子流程按路由加 JWT 或短期状态 | `app/http_routes.go`；注册、登录、刷新、找回密码、OAuth、Passkey 登录和身份补全 |
-| `/api/v1/user/*`、`/keys`、`/team`、`/groups`、`/subscriptions`、`/redeem` 等 | 用户 JWT | `app/http_routes.go`；用户面板的资源、团队、Key、用量和权益查询 |
+| `/api/v1/user/*`、`/keys`、`/team`、`/groups`、`/subscriptions`、`/redeem` 等 | 用户 JWT 或已启用的 central cookie | `app/http_routes.go`；用户面板的资源、团队、Key、用量和权益查询；中央会话还按所选资源检查 assurance |
 | `/api/v1/marketplace/models`、`/api/v1/marketplace/stats` | 无 | `routing/httpapi`；公开模型分组和首页汇总 |
-| `/api/v1/marketplace/models/available` | 用户 JWT | `routing/httpapi`；公开分组和当前用户获授权的专属分组，使用私有、不缓存的响应 |
+| `/api/v1/marketplace/models/available` | 用户 JWT 或已启用的 central cookie | `routing/httpapi`；公开分组和当前用户获授权的专属分组，使用私有、不缓存的响应 |
 | `/api/v1/admin/plugins*`、`/api/v1/admin/plugin-catalog*`、`/api/v1/admin/plugin-indexes*` | 管理员，执行代码与来源变更另需 step-up | `plugin/httpapi`；安装、更新回滚、市场与索引来源，见[安装管理](plugin_contracts.md#administration) |
-| `/api/v1/plugins/*` | UI 描述要求用户 JWT，资源公开，API 按 manifest 选择认证 | `plugin/httpapi`；插件页面描述、版本化静态资源和非流式 HTTP 代理，见[插件契约](plugin_contracts.md#http_contributions) |
+| `/api/v1/plugins/*` | UI 描述要求用户 JWT 或 central cookie，资源公开，API 按 manifest 选择认证 | `plugin/httpapi`；插件页面描述、版本化静态资源和非流式 HTTP 代理，见[插件契约](plugin_contracts.md#http_contributions) |
 | `/api/v1/admin/*` | 管理员 JWT 或受限的管理密钥；部分操作还需要 step-up | `app/http_routes_admin.go`；用户、分组、提供商、价格配置、设置、运维、备份、支付和安全管理 |
 | `/mcp` | 专用 MCP Bearer 令牌 | 四个通用管理工具，按具体操作授权；协议为 MCP JSON-RPC，见 [MCP 管理接口](mcp_management.md) |
-| `/api/v1/payment/*` | 用户 JWT | `app/http_routes.go`；读取配置和套餐、下单、查单、取消、invoice 和申请退款 |
+| `/api/v1/payment/*` | 用户 JWT 或已启用的 central cookie | `app/http_routes.go`；读取配置和套餐、下单、查单、取消、invoice 和申请退款 |
 | `/api/v1/payment/public/*` | 签名的 resume token，或旧订单的验证约束 | 恢复支付结果；这组接口只服务已知订单，匿名列举订单是不允许的 |
 | `/api/v1/payment/webhook/*` | 提供商验签 | EasyPay、Alipay、WeChat Pay、Stripe、Airwallex 的通知 |
 | `/v1/*` 和兼容的裸路径别名 | TokenRouter API Key | Anthropic 和 OpenAI 兼容的消息、Responses、Chat、图片、视频、模型、用量和批任务 |
@@ -284,6 +284,7 @@ Key 自身的配额和滚动限额字段不受这些展示规则影响。
 | 凭据 | 放在哪里 | 授权范围 |
 | --- | --- | --- |
 | JWT access token | 面板的 `Authorization: Bearer`，少数 WebSocket 用子协议 | 检查当前用户状态、token version 和可选的会话绑定；管理员还检查当前角色 |
+| central session | `HttpOnly` cookie 加内存中的 `X-CSRF-Token` | 检查当前中央状态、原始 admission、固定时限与本地账户；受保护读取也需要 CSRF，资源权限继续独立判断 |
 | Refresh token | `/api/v1/auth/refresh`，以及 logout 约定的 payload 或 cookie | 只用于轮换和撤销，无法直接访问业务资源 |
 | 管理 API Key | 管理接口的 `x-api-key` | 代表第一个实际的管理员；开启敏感操作 step-up 后，需要近期 TOTP 的操作无法用它执行 |
 | TokenRouter API Key | 网关的 `Authorization: Bearer`、`x-api-key`，Gemini 兼容入口还有 `x-goog-api-key` | Key、用户和团队、分组、IP、额度和订阅、请求资源的归属；通用网关拒绝放在 query 里的 Key |
@@ -299,6 +300,8 @@ Key 自身的配额和滚动限额字段不受这些展示规则影响。
 外部支付服务使用管理 API Key，通过 `x-api-key` 调用管理路由；管理员 JWT 适合交互式的管理端。支付成功后的余额发放，优先使用 `POST /api/v1/admin/redeem-codes/create-and-redeem`，由服务端原子地创建并兑换余额兑换码。调用方要提供稳定的业务 `code` 和 `Idempotency-Key`，同一操作重试时复用这两个值，并按 200、409 和业务错误区分重放、冲突和失败。`GET /api/v1/admin/users/:id` 可以用来做前置查询；`POST /api/v1/admin/users/:id/balance` 只用于明确的人工增减或补偿，同样需要幂等键。
 
 购买页和用户自定义页面的 URL 由前端追加 `user_id`、`token`、`theme`、`lang`、`ui_mode`、`src_host` 和 `src_url`。其中 `token` 是用户的 Bearer 凭据，只能发给部署者信任、并且使用 HTTPS 的页面；接收方不应把它写进访问日志、分析参数，或转发给第三方。完整的请求示例和重试约定见[外部支付管理 API 指南](../guides/payments/admin_integration_api.md)。
+
+central 模式没有可供这些页面转发的 Bearer token，相关占位值为空；HttpOnly cookie 和 provider credential 不进入嵌入 URL。依赖旧 token 参数的外部页面需要单独接入，不能把用户 ID 当作替代凭据。
 
 ## API Key 上游用量查询
 

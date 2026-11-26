@@ -21,7 +21,8 @@ import (
 // serialize status publication before applying these rules to requests.
 
 const (
-	// These lifecycle values confer no product role, entitlement or membership.
+	// These lifecycle observations determine account eligibility only; they confer
+	// no product role, entitlement, permission grant or team membership.
 	CentralEligibilityUnknown CentralEligibility = iota
 	CentralEligibilityActive
 	CentralEligibilitySuspended
@@ -48,7 +49,8 @@ const (
 	CentralProfileIndependentContinuity
 )
 
-// These access classes select authentication assurance before product permissions.
+// These access classes select authentication assurance before separate product
+// permissions and server-resolved resource ownership are evaluated.
 //
 //nolint:decorder // Separate const blocks keep each iota sequence starting at zero.
 const (
@@ -148,9 +150,13 @@ type CentralConsumerPolicy struct {
 	ContinuityPolicyVersion uint32 // qualified continuity policy version
 }
 
-// ValidateCentralStatus checks identity, counter presence and the absolute
-// observation budget. Request start is captured before the authority call;
-// neither transit time nor response arrival creates a replacement lease.
+// ValidateCentralStatus rejects evidence with an unexpected authority,
+// consumer, missing counter, or invalid observation window. Callers capture
+// requestStartedAt before contacting the authority and supply the current time
+// after the response arrives. The source lease already reserves clock
+// uncertainty inside the total budget. Neither network delay nor a later
+// response can start another full lease, and a structurally valid but
+// exhausted window returns the distinct stale-evidence error.
 func ValidateCentralStatus(policy CentralConsumerPolicy, status CentralStatusEvidence, requestStartedAt, now time.Time) error {
 	if !centralIdentifier(policy.ConsumerID) || !centralIdentifier(policy.OrdinaryPolicyID) || policy.OrdinaryPolicyVersion == 0 ||
 		!centralIdentifier(status.Account.AccountID) || !centralIdentifier(status.Account.AuthorityIncarnation) ||
@@ -254,8 +260,10 @@ func AuthorizeCentralSession(policy CentralConsumerPolicy, session CentralSessio
 	return nil
 }
 
-// centralIdentifier rejects unbounded, padded or control-bearing trusted identifiers.
-// It preserves opaque identifier case and does not invent normalization rules.
+// centralIdentifier rejects empty, oversized, padded or control-bearing
+// trusted identifiers. It preserves opaque identifier case and content because
+// normalization could make different authority subjects compare as one
+// account.
 func centralIdentifier(value string) bool {
 	return value != "" && len(value) <= 1024 && value == strings.TrimSpace(value) &&
 		!strings.ContainsFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f })

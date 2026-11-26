@@ -35,6 +35,8 @@ import (
 // upstream outage. Only an explicit loopback TEST configuration uses
 // non-Secure cookies, under names distinct from the production host cookies.
 
+// These cookie names keep the production host boundary distinct from explicit
+// loopback TEST sessions; the context key carries one verified request snapshot.
 const (
 	centralSessionCookie     = "__Host-gettok-central"       // production host-only browser credential
 	centralLoginCookie       = "__Host-gettok-central-login" // production browser-transaction binding
@@ -73,8 +75,10 @@ type CentralStartRequest struct {
 	OAuthStartCaptchaRequest        // existing anonymous action challenge fields
 }
 
-// RegisterCentralAuthenticationRoutes mounts the separately bounded shared flow.
-// The surrounding application supplies the same fail-closed rate limiter as legacy login.
+// RegisterCentralAuthenticationRoutes mounts the optional shared browser flow
+// inside the existing authentication boundary. A nil handler leaves routes
+// absent; composition supplies audit, backend-mode and fail-closed rate
+// middleware.
 func RegisterCentralAuthenticationRoutes(v1 *gin.RouterGroup, handler *CentralHandler, guards AuthRouteMiddleware) {
 	if handler == nil {
 		return
@@ -87,7 +91,10 @@ func RegisterCentralAuthenticationRoutes(v1 *gin.RouterGroup, handler *CentralHa
 	group.POST("/logout", handler.Logout)
 }
 
-// Config exposes only display and capability data, never endpoints or client credentials.
+// Config exposes browser labels and currently available login capabilities
+// without disclosing endpoints or client credentials. Backend mode disables
+// new shared login, and the migration flag reflects only the explicitly
+// enabled TEST profile.
 func (h *CentralHandler) Config(c *gin.Context) {
 	centralNoStore(c)
 	providers := make([]gin.H, 0)
@@ -107,8 +114,13 @@ func (h *CentralHandler) Config(c *gin.Context) {
 	response.Success(c, gin.H{"enabled": loginEnabled, "provider_name": h.Options.ProviderName, "providers": providers, "legacy_binding_enabled": loginEnabled && h.Flow.Options.TestBindingProfile == identity.CentralTestBindingProfile})
 }
 
-// Start validates exact origin, explicit intent and its existing admission gates.
-// Only bind may carry a legacy Bearer, and that token alone cannot authorize migration.
+// Start validates the configured browser origin and decodes one bounded
+// explicit account intent. Anonymous login and registration retain the
+// existing CAPTCHA gate, while TEST binding requires a current legacy session
+// plus fresh password and enrolled-factor proof. Mixed identity inputs and
+// unknown JSON fields are rejected before creating a transaction. Only after
+// the encrypted intent is persisted does the response set its browser binding
+// cookie and return the configured provider authorization URL.
 func (h *CentralHandler) Start(c *gin.Context) {
 	centralNoStore(c)
 	if !h.enabled(c) || !h.browserOrigin(c, true) {
@@ -162,8 +174,13 @@ func (h *CentralHandler) Start(c *gin.Context) {
 	response.Success(c, gin.H{"authorization_url": result.AuthorizationURL})
 }
 
-// Callback finishes the one-use transaction and replaces the opaque session only after commit.
-// The browser sees a fixed callback route and a finite allowlist of error categories.
+// Callback finishes one browser-bound transaction and exposes the new session
+// only after its local commit. It accepts a single code and state, rejects a
+// contradictory issuer or mixed Bearer credential, and consumes the
+// transaction before provider exchange. A known previous cookie is revoked
+// before publishing its replacement. The response redirects to a fixed
+// frontend route with a finite error category; failed exchanges never return
+// provider diagnostics or credentials to that route.
 func (h *CentralHandler) Callback(c *gin.Context) {
 	centralNoStore(c)
 	if !h.enabled(c) {
@@ -224,11 +241,18 @@ func (h *CentralHandler) Session(c *gin.Context) {
 // It never emits cookie deletion that could erase a later concurrently established session.
 func (h *CentralHandler) Logout(c *gin.Context) { h.logout(c, false) }
 
-// RevokeAll revokes this local user's human sessions without changing machine API keys.
+// RevokeAll withdraws this local user's human browser sessions after the
+// normal logout proof checks. It leaves machine API keys and central lifecycle
+// state to their separately owned authorization paths.
 func (h *CentralHandler) RevokeAll(c *gin.Context) { h.logout(c, true) }
 
-// logout verifies the separate CSRF secret against persisted original session evidence.
-// Expiry or upstream suspension does not prevent withdrawal of local sessions.
+// logout verifies exact browser origin and the separate CSRF secret against
+// persisted original session evidence. Expiry or upstream suspension does not
+// prevent withdrawal of local sessions, because logout does not depend on a
+// fresh authority call. Database failure remains an error, and the response
+// reports success only after revocation commits. It leaves the cookie to
+// expire naturally so a delayed logout response cannot delete a newer session
+// created by another login.
 func (h *CentralHandler) logout(c *gin.Context, all bool) {
 	centralNoStore(c)
 	if !h.enabled(c) || !h.browserOrigin(c, true) {
@@ -264,8 +288,18 @@ func (h *CentralHandler) logout(c *gin.Context, all bool) {
 	response.Success(c, gin.H{"revoked": true})
 }
 
-// Wrap selects central cookie admission before an existing human-authentication guard.
-// The separate machine-token middleware remains outside this wrapper in composition.
+// Wrap selects central cookie admission before the existing human
+// authentication guard and leaves machine-token authentication to composition.
+// A live or unknown cookie cannot silently downgrade to a supplied legacy
+// credential; only a durable revoked or expired session permits that explicit
+// fallback. Protected reads also require the session's memory-held proof,
+// preventing an old tab from accepting another tab's newly issued cookie as
+// its own account.
+//
+// After fresh admission, the wrapper applies route assurance and local
+// administrator checks, then installs a verifier capturing the original
+// session evidence. Resource handlers must still decide product ownership and
+// roles before returning or changing their selected resource.
 func (h *CentralHandler) Wrap(legacy gin.HandlerFunc, administrator bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !h.HasCookie(c) {
@@ -329,7 +363,10 @@ func (h *CentralHandler) Wrap(legacy gin.HandlerFunc, administrator bool) gin.Ha
 	}
 }
 
-// HasCookie recognizes both known names so disabling a profile cannot silently select legacy auth.
+// HasCookie recognizes both production and explicit TEST session-cookie names.
+// This selection remains independent of the active profile so disabling shared
+// authentication cannot silently route a previously central session through
+// legacy authentication.
 func (h *CentralHandler) HasCookie(c *gin.Context) bool {
 	for _, cookie := range c.Request.Cookies() {
 		if cookie.Name == centralSessionCookie || cookie.Name == centralTestSessionCookie {
@@ -339,7 +376,9 @@ func (h *CentralHandler) HasCookie(c *gin.Context) bool {
 	return false
 }
 
-// authenticate rejects mixed identities before resolving one bounded browser credential.
+// authenticate rejects mixed Bearer and cookie identities before resolving a
+// bounded browser credential. A supplied CSRF proof must match; only the
+// dedicated bootstrap caller may proceed without one.
 func (h *CentralHandler) authenticate(c *gin.Context) (identity.CentralAuthenticated, bool) {
 	if c.GetHeader("Authorization") != "" {
 		centralHTTPError(c, identity.ErrCentralEvidenceInvalid)
@@ -362,7 +401,9 @@ func (h *CentralHandler) authenticate(c *gin.Context) (identity.CentralAuthentic
 	return verified, true
 }
 
-// enabled denies disabled shared authentication without falling back to local credentials.
+// enabled reports whether the startup composition supplied a shared
+// authentication flow. A disabled flow writes an unavailable response instead
+// of selecting legacy credentials for an already central cookie.
 func (h *CentralHandler) enabled(c *gin.Context) bool {
 	if h.Flow != nil {
 		return true
@@ -371,8 +412,14 @@ func (h *CentralHandler) enabled(c *gin.Context) bool {
 	return false
 }
 
-// browserOrigin requires exact-origin mutations and rejects cross-origin browser reads.
-// Missing Origin on safe navigation or non-browser reads does not grant mutation access.
+// browserOrigin validates the effective application Host and any supplied
+// Origin before cookie-authenticated work. Mutations require the exact
+// configured Origin; safe reads may omit it for ordinary same-origin
+// navigation or non-browser clients. Explicit cross-site and sibling-site
+// fetch metadata remains rejected even when cookies would otherwise be sent.
+// This check establishes browser provenance only: protected resources
+// separately require the current session proof, while initial bootstrap has
+// its own limited proof-free entry.
 func (h *CentralHandler) browserOrigin(c *gin.Context, mutation bool) bool {
 	origin, err := url.Parse(h.Options.Origin)
 	if err != nil || c.Request.Host != origin.Host || mutation && c.GetHeader("Origin") != h.Options.Origin || c.GetHeader("Origin") != "" && c.GetHeader("Origin") != h.Options.Origin || c.GetHeader("Sec-Fetch-Site") == "cross-site" || c.GetHeader("Sec-Fetch-Site") == "same-site" {
@@ -382,7 +429,10 @@ func (h *CentralHandler) browserOrigin(c *gin.Context, mutation bool) bool {
 	return true
 }
 
-// readCookie rejects ambiguous duplicate or cross-profile cookie names.
+// readCookie selects the expected session or transaction cookie for the
+// configured transport profile. Duplicate names, the alternate profile's
+// cookie, and missing or incorrectly sized values fail before any authority
+// lookup.
 func (h *CentralHandler) readCookie(c *gin.Context, login bool) (string, error) {
 	wanted := centralSessionCookie
 	alternate := centralTestSessionCookie
@@ -407,7 +457,13 @@ func (h *CentralHandler) readCookie(c *gin.Context, login bool) (string, error) 
 	return value, nil
 }
 
-// cookie writes only host-only, HttpOnly, Lax cookies with finite absolute expiration.
+// cookie writes the opaque session or transaction value with host-only,
+// HttpOnly and Lax attributes. Production uses Secure prefixed names, while
+// explicitly enabled loopback TEST transport uses different names without
+// Secure. The caller supplies the already bounded absolute expiration;
+// converting the remaining interval to whole seconds does not extend server
+// admission. Empty values clear the selected cookie; the callback uses this
+// for its transaction cookie. Logout leaves the session cookie untouched.
 func (h *CentralHandler) cookie(c *gin.Context, login bool, value string, expires time.Time) {
 	name := centralSessionCookie
 	if login {
@@ -426,7 +482,10 @@ func (h *CentralHandler) cookie(c *gin.Context, login bool, value string, expire
 	http.SetCookie(c.Writer, &http.Cookie{Name: name, Value: value, Path: "/", Secure: !h.Options.TestLoopback, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: expires, MaxAge: maxAge})
 }
 
-// callbackError maps sensitive failures to a fixed frontend route and finite public reason.
+// callbackError maps authentication failures to a fixed frontend destination
+// and a finite public reason. It never copies upstream diagnostics or accepts
+// a browser-selected return destination that could receive callback
+// credentials.
 func (h *CentralHandler) callbackError(c *gin.Context, err error) {
 	reason := "authentication_failed"
 	switch {
@@ -455,7 +514,10 @@ func centralSafeMethod(method string) bool {
 	return method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
 }
 
-// centralHTTPError preserves retryable outages separately from authentication and assurance denial.
+// centralHTTPError preserves retryable outages separately from invalid
+// authentication and insufficient assurance. Stable public categories let the
+// browser retain an ordinary session on a stronger-proof refusal without
+// exposing provider or persistence diagnostics.
 func centralHTTPError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, identity.ErrCentralUnavailable), errors.Is(err, identity.ErrCentralEvidenceStale):
