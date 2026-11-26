@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+
+	"github.com/TokenFlux/TokenRouter/internal/identity"
 )
 
 // central_auth_test.go checks the browser boundary independently of network
@@ -22,6 +25,68 @@ import (
 // focus on browser properties that a server-side cookie jar cannot establish:
 // HttpOnly, host-only scope, Secure production transport and rejection of
 // cross-site or same-site sibling origins before application state changes.
+
+// centralHTTPStoreProbe returns one already committed owner for middleware scenarios.
+type centralHTTPStoreProbe struct {
+	identity.CentralSessionStore                                // unused writes fail if a read-only guard invokes them
+	session                      identity.CentralSession        // immutable session issued to the replacement tab
+	status                       identity.CentralStatusEvidence // fresh authority observation
+	user                         *identity.User                 // current active owner for the opaque cookie
+}
+
+// centralHTTPAuthorityProbe supplies only the fresh read used by this middleware test.
+type centralHTTPAuthorityProbe struct {
+	identity.CentralIdentityAuthority                                // human resolution is outside this guard scenario
+	status                            identity.CentralStatusEvidence // fresh observation of the replacement owner
+}
+
+// ReadSession returns the original persisted session before authority observation.
+func (p *centralHTTPStoreProbe) ReadSession(context.Context, string) (identity.CentralSession, error) {
+	return p.session, nil
+}
+
+// PublishAndRead supplies the unchanged committed facts after a successful fresh read.
+func (p *centralHTTPStoreProbe) PublishAndRead(context.Context, string, identity.CentralStatusEvidence) (identity.CentralSession, identity.CentralStatusEvidence, *identity.User, error) {
+	return p.session, p.status, p.user, nil
+}
+
+// GetAccountStatus returns the independently authenticated observation for the fixture.
+func (p *centralHTTPAuthorityProbe) GetAccountStatus(context.Context, identity.CentralAccountReference) (identity.CentralStatusEvidence, error) {
+	return p.status, nil
+}
+
+// TestCentralProtectedReadsRequireSessionProof rejects a legacy tab whose shared
+// storage was cleared while another tab acquired a new HttpOnly cookie. A valid
+// cookie alone must not load a replacement owner's profile into the stale view.
+func TestCentralProtectedReadsRequireSessionProof(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	policy := identity.CentralConsumerPolicy{ConsumerID: "gettok", AuthorityIncarnation: "authority-test", OrdinaryPolicyID: "gettok-ordinary-login", OrdinaryPolicyVersion: 1}
+	status := identity.CentralStatusEvidence{Account: identity.CentralAccountReference{AccountID: "replacement-owner", AuthorityIncarnation: policy.AuthorityIncarnation}, ConsumerID: policy.ConsumerID, Eligibility: identity.CentralEligibilityActive, Revision: 1, SecurityEpoch: 1, AttachmentGeneration: 1, ObservedAt: now, ValidUntil: now.Add(identity.CentralSourceLease)}
+	secret, csrf := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	session := identity.CentralSession{Digest: identity.CentralSecretDigest(secret), CSRFSecret: csrf, LocalUserID: 7, Account: status.Account, SecurityEpoch: 1, AttachmentGeneration: 1, CreatedAt: now, ExpiresAt: now.Add(4 * time.Minute), Admission: identity.CentralSessionAdmission{AuthoritySessionID: "verified-kc-session", Profile: identity.CentralProfileProviderSession, PolicyID: policy.OrdinaryPolicyID, PolicyVersion: 1, AuthenticatedAt: now.Add(-time.Minute), ValidUntil: now.Add(4 * time.Minute)}}
+	store := &centralHTTPStoreProbe{session: session, status: status, user: &identity.User{ID: 7, Status: "active", Role: "user", CentralManaged: true}}
+	handler := &CentralHandler{Options: CentralHTTPOptions{Origin: "http://127.0.0.1:18182", TestLoopback: true}, Flow: &identity.CentralFlow{Options: identity.CentralLoginOptions{Policy: policy}, Store: store, Authority: &centralHTTPAuthorityProbe{status: status}, Now: func() time.Time { return now }}}
+	for _, row := range []struct {
+		proof  string // memory-held session proof, absent in a stale legacy tab
+		status int    // expected refusal before the protected profile handler
+	}{{"", http.StatusForbidden}, {strings.Repeat("c", 64), http.StatusForbidden}, {csrf, http.StatusOK}} {
+		profileReads, legacyCalls := 0, 0
+		engine := gin.New()
+		engine.GET("/api/v1/auth/me", handler.Wrap(func(c *gin.Context) { legacyCalls++; c.AbortWithStatus(http.StatusUnauthorized) }, false), func(c *gin.Context) { profileReads++; c.Status(http.StatusOK) })
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:18182/api/v1/auth/me", nil)
+		request.AddCookie(&http.Cookie{Name: centralTestSessionCookie, Value: secret})
+		request.Header.Set("X-CSRF-Token", row.proof)
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		require.Equal(t, row.status, response.Code)
+		require.Zero(t, legacyCalls)
+		if row.status == http.StatusOK {
+			require.Equal(t, 1, profileReads)
+		} else {
+			require.Zero(t, profileReads)
+		}
+	}
+}
 
 // TestCentralCookieCustody keeps production and TEST cookies visibly distinct.
 func TestCentralCookieCustody(t *testing.T) {

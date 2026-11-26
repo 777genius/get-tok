@@ -162,6 +162,11 @@ func TestCentralStoreBindingAndRevocation(t *testing.T) {
 	require.Equal(t, user.ID, commit.User.ID)
 	require.Equal(t, float64(42), commit.User.Balance)
 	require.True(t, commit.User.CentralManaged)
+	err = store.auth.AuthEnsureEmailOAuthIdentity(ctx, commit.User.ID, identity.EmailOAuthIdentityInput{ProviderType: "github", ProviderKey: "github", ProviderSubject: "delayed-legacy-subject", Email: commit.User.Email, EmailVerified: true})
+	require.ErrorIs(t, err, identity.ErrCentralLoginRequired)
+	var legacyBindings int
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM auth_identities WHERE user_id=$1 AND provider_subject='delayed-legacy-subject'", commit.User.ID).Scan(&legacyBindings))
+	require.Zero(t, legacyBindings)
 	legacy := identity.NewSessionService(identity.SessionOptions{Secret: "test-secret", ExpireHour: 1}, store.auth.Users, nil, nil, nil)
 	_, err = legacy.GenerateToken(ctx, commit.User)
 	require.ErrorIs(t, err, identity.ErrCentralLoginRequired)

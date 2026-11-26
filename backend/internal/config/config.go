@@ -3256,6 +3256,9 @@ func (c *Config) Validate() error {
 	if err := c.CentralIdentity.Validate(); err != nil {
 		return err
 	}
+	if c.CentralIdentity.Enabled && !c.CentralIdentity.TestLoopback && !c.Totp.EncryptionKeyConfigured {
+		return fmt.Errorf("central_identity requires a configured persistent totp.encryption_key outside the TEST loopback profile")
+	}
 	if c.Billing.CircuitBreaker.Enabled {
 		if c.Billing.CircuitBreaker.FailureThreshold <= 0 {
 			return fmt.Errorf("billing.circuit_breaker.failure_threshold must be positive")

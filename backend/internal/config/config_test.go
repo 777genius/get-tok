@@ -19,6 +19,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestLoadCentralIdentityRequiresPersistentEncryption loads the real environment
+// configuration, requiring a shared configured key before production-form central
+// authentication can retain browser transactions across replicas or restarts.
+func TestLoadCentralIdentityRequiresPersistentEncryption(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	for name, value := range map[string]string{
+		"CENTRAL_IDENTITY_ENABLED":                "true",
+		"CENTRAL_IDENTITY_ORIGIN":                 "https://gettok.example.invalid",
+		"CENTRAL_IDENTITY_API_URL":                "https://identity.example.invalid",
+		"CENTRAL_IDENTITY_ISSUER_URL":             "https://accounts.example.invalid/realms/identity",
+		"CENTRAL_IDENTITY_AUTHORITY_INCARNATION":  "authority-test",
+		"CENTRAL_IDENTITY_CLIENT_ID":              "human-test",
+		"CENTRAL_IDENTITY_CLIENT_SECRET":          "synthetic-human-secret",
+		"CENTRAL_IDENTITY_WORKLOAD_CLIENT_ID":     "workload-test",
+		"CENTRAL_IDENTITY_WORKLOAD_CLIENT_SECRET": "synthetic-workload-secret",
+		"TOTP_ENCRYPTION_KEY":                     "",
+	} {
+		t.Setenv(name, value)
+	}
+	_, err := Load()
+	require.ErrorContains(t, err, "central_identity requires a configured persistent")
+	t.Setenv("TOTP_ENCRYPTION_KEY", strings.Repeat("a", 64))
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.True(t, cfg.CentralIdentity.Enabled)
+	require.True(t, cfg.Totp.EncryptionKeyConfigured)
+	cfg.CentralIdentity.APIURL += "?"
+	require.Error(t, cfg.CentralIdentity.Validate())
+	cfg.CentralIdentity.APIURL = "http://127.0.0.1:18183"
+	require.Error(t, cfg.CentralIdentity.Validate())
+	cfg.CentralIdentity.TestLoopback = true
+	require.Error(t, cfg.CentralIdentity.Validate(), "TEST mode cannot retain remote identity endpoints")
+}
+
 // TestLoadDefaultModelsListReadMaxBytes loads configuration with the standard
 // fixture JWT secret. The model-list body limit must equal the named default
 // used for upstream model responses.

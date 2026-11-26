@@ -28,6 +28,10 @@ import (
 // dashboards count observed durations. Calendar supplies local midnight, but raw
 // administrator today spans use twenty-four elapsed hours and recent rates use
 // separate system-clock windows.
+// The personal dashboard bypasses owner-visible analytics and applies a stored
+// team_id exclusion to every key, usage and recent-rate query. It does not read
+// current team membership, so a concurrent invitation or ownership transfer
+// cannot broaden an ordinary session's report.
 
 // UserStats contains raw actor request, token, and actual-charge totals.
 type UserStats struct {
@@ -465,28 +469,58 @@ func (r *Store) fillDashboardUsageStatsFromUsageLogs(ctx context.Context, stats 
 }
 
 // GetUserDashboardStats returns retained actor and current owned-team metrics,
-// key counts, and recent rates. Usable multidimensional analytics supplies the
-// response; an unavailable or failed attempt chooses the complete raw dashboard.
+// key counts, and recent rates. Callers authorize this owner-visible scope;
+// ordinary central sessions use GetPersonalDashboardStats to retain their
+// persisted team exclusion throughout the report.
+func (r *Store) GetUserDashboardStats(ctx context.Context, userID int64) (*UserDashboardStats, error) {
+	return r.getScopedUserDashboardStats(ctx, userID, false)
+}
+
+// GetPersonalDashboardStats returns counters for a positive actor's personal resources.
+// Every contributing key and usage row must have no stored team attribution.
+// Invalid user IDs are rejected, and a failed read returns no partial dashboard.
+func (r *Store) GetPersonalDashboardStats(ctx context.Context, userID int64) (*UserDashboardStats, error) {
+	if userID <= 0 {
+		return nil, errors.New("personal dashboard requires a positive user ID")
+	}
+	return r.getScopedUserDashboardStats(ctx, userID, true)
+}
+
+// getScopedUserDashboardStats computes counters within one explicit resource scope.
+// Personal reads exclude stored team attribution in every query and do not
+// consult current membership. Broader reads retain the existing analytics-first
+// path and fall back to complete raw counters when analytics is unavailable.
 //
 // Raw actor and team branches exclude duplicate owner rows and use one scan for
 // all-time and today sums. Today begins at Calendar midnight with no upper
 // bound, including future-dated records. Duration averages count observed
 // duration values, and key, usage, and rate callbacks write distinct fields
-// before their executor-aware runner is joined. The caller authorizes the user's
-// owner-visible scope.
-func (r *Store) GetUserDashboardStats(ctx context.Context, userID int64) (*UserDashboardStats, error) {
+// before their executor-aware runner is joined. The same personal-only choice
+// reaches recent-rate calculation, preventing that smaller query from widening
+// the dashboard's resource visibility.
+func (r *Store) getScopedUserDashboardStats(ctx context.Context, userID int64, personalOnly bool) (*UserDashboardStats, error) {
 	// Analytics availability or query failure selects a complete raw dashboard;
 	// accumulated fields from an unsuccessful analytics attempt are discarded.
-	if stats, ok, err := r.getUserDashboardStatsFromAnalytics(ctx, userID); err == nil && ok {
-		return stats, nil
-	} else if err != nil {
-		r.logUsageAnalyticsFallback("user_dashboard", err)
+	// Personal scope uses the raw predicates because this analytics entry includes teams.
+	if !personalOnly {
+		if stats, ok, err := r.getUserDashboardStatsFromAnalytics(ctx, userID); err == nil && ok {
+			return stats, nil
+		} else if err != nil {
+			r.logUsageAnalyticsFallback("user_dashboard", err)
+		}
 	}
 	stats := &UserDashboardStats{}
 	today := r.calendar.Today()
-	teamID, err := r.getOwnedTeamID(ctx, userID)
-	if err != nil {
-		return nil, err
+	var teamID int64
+	personalCondition := ""
+	if personalOnly {
+		personalCondition = " AND team_id IS NULL"
+	} else {
+		var err error
+		teamID, err = r.getOwnedTeamID(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Actor and owned-team branches share the selected scope. Excluding owner rows
@@ -495,7 +529,7 @@ func (r *Store) GetUserDashboardStats(ctx context.Context, userID int64) (*UserD
 		return scanSingleRow(queryCtx, r.sql, `
 			WITH scoped AS (
 				SELECT status FROM api_keys
-				WHERE deleted_at IS NULL AND user_id = $1
+				WHERE deleted_at IS NULL AND user_id = $1`+personalCondition+`
 				UNION ALL
 				SELECT status FROM api_keys
 				WHERE deleted_at IS NULL AND $2 > 0 AND team_id = $2 AND user_id <> $1
@@ -511,7 +545,7 @@ func (r *Store) GetUserDashboardStats(ctx context.Context, userID int64) (*UserD
 		WITH scoped AS (
 			SELECT created_at, input_tokens, output_tokens, cache_creation_tokens,
 			       cache_read_tokens, total_cost, actual_cost, duration_ms
-			FROM usage_logs WHERE user_id = $1
+			FROM usage_logs WHERE user_id = $1` + personalCondition + `
 			UNION ALL
 			SELECT created_at, input_tokens, output_tokens, cache_creation_tokens,
 			       cache_read_tokens, total_cost, actual_cost, duration_ms
@@ -563,7 +597,7 @@ func (r *Store) GetUserDashboardStats(ctx context.Context, userID int64) (*UserD
 	var rpm, tpm int64
 	loadPerformanceStats := func(queryCtx context.Context) error {
 		var performanceErr error
-		rpm, tpm, performanceErr = r.getPerformanceStatsForScope(queryCtx, userID, teamID)
+		rpm, tpm, performanceErr = r.getPerformanceStatsForScope(queryCtx, userID, teamID, personalOnly)
 		return performanceErr
 	}
 	if err := r.runDashboardQueries(ctx, loadAPIKeyStats, loadUsageStats, loadPerformanceStats); err != nil {

@@ -55,6 +55,6 @@ func RequireCentralAccess(c *gin.Context, required identity.CentralAccessClass) 
 	if CentralAccessError(c, required) == nil {
 		return true
 	}
-	httpx.AbortWithError(c, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", "This operation requires qualified account continuity proof")
+	httpx.AbortWithError(c, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", "Additional account verification is required for this action.")
 	return false
 }

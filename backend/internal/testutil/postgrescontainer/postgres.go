@@ -21,15 +21,21 @@ import (
 	"github.com/TokenFlux/TokenRouter/migrations"
 )
 
-// postgres.go starts a dedicated PostgreSQL test container and applies
-// application migrations.
-// PostgreSQL storage fixtures apply the application's embedded migrations
-// before domain records are read or written. New starts a dedicated container,
-// obtains a UTC connection, and registers cleanup so the SQL pool closes before
-// container termination at test completion.
+// postgres.go creates isolated PostgreSQL fixtures and applies application
+// migrations before domain records are read or written. The ordinary profile
+// starts a dedicated container. An explicitly supplied loopback TEST server can
+// instead host a randomly named temporary database; the supplied administrator
+// database is never migrated or dropped. Both paths exercise the same embedded
+// production migrations and return a SQL pool owned by the calling test.
+//
+// Cleanup runs after dependent test participants have stopped. The SQL pool
+// closes before its container terminates or its temporary database is removed.
+// Native mode is useful for verified PostgreSQL runtimes on executors without
+// Docker, and remains distinct from changing the configured container image.
 
 // New returns a pool for a dedicated migrated PostgreSQL fixture or fails the
-// calling test. Container startup, connection-string discovery, and migrations
+// calling test. An explicit TOKENROUTER_TEST_POSTGRES_DSN selects native mode.
+// Container startup, connection-string discovery, and migrations
 // share a two-minute context; TOKENROUTER_TEST_POSTGRES_IMAGE can replace the
 // default image. Cleanup closes the pool before terminating any created
 // container with a fresh thirty-second context, including after startup errors.

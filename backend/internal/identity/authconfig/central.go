@@ -54,7 +54,7 @@ func (c CentralIdentityConfig) Validate() error {
 	}
 	for name, value := range map[string]string{"origin": c.Origin, "api_url": c.APIURL, "issuer_url": c.IssuerURL} {
 		u, err := url.Parse(value)
-		if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" || value != strings.TrimRight(value, "/") || u.RawPath != "" || len(value) > 2048 {
+		if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" || value != strings.TrimRight(value, "/") || u.RawPath != "" || len(value) > 2048 {
 			return fmt.Errorf("central_identity.%s must be a canonical absolute URL", name)
 		}
 		loopback := u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost" || u.Hostname() == "::1"

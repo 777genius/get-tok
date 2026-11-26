@@ -107,7 +107,7 @@ func (c *CentralIdentityClient) workloadCredential(ctx context.Context) (string,
 	if err != nil {
 		return "", identity.ErrCentralUnavailable
 	}
-	request.SetBasicAuth(c.options.WorkloadClientID, c.options.WorkloadClientSecret)
+	request.SetBasicAuth(url.QueryEscape(c.options.WorkloadClientID), url.QueryEscape(c.options.WorkloadClientSecret))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
 	response, err := c.http.Do(request)
@@ -210,7 +210,7 @@ func centralTimestamp(value *timestamppb.Timestamp, required bool) (time.Time, e
 // centralRPCError maps only recognized protocol semantics without retaining diagnostics.
 // Unknown details and authentication failures deny use; infrastructure errors remain unavailable.
 func centralRPCError(err error) error {
-	if connect.CodeOf(err) == connect.CodeUnavailable || connect.CodeOf(err) == connect.CodeDeadlineExceeded || connect.CodeOf(err) == connect.CodeResourceExhausted {
+	if connect.CodeOf(err) == connect.CodeUnavailable || connect.CodeOf(err) == connect.CodeDeadlineExceeded || connect.CodeOf(err) == connect.CodeResourceExhausted || connect.CodeOf(err) == connect.CodeInternal {
 		return identity.ErrCentralUnavailable
 	}
 	var failure *connect.Error

@@ -13,7 +13,9 @@ import (
 	"github.com/TokenFlux/TokenRouter/internal/usage"
 )
 
-// Key dashboard totals combine retained usage, local today, nonnull duration
+// usage_log_repo_dashboard_integration_test.go verifies personal resource scope
+// and Key dashboard totals with migrated PostgreSQL rows. Totals combine
+// retained usage, local today, nonnull duration
 // averages, and recent raw rates. A Kathmandu fixture compares raw and analytics
 // results with future records, then deletes older rows to check that stale
 // rollup history does not enlarge the retained total.
@@ -66,4 +68,47 @@ func (s *UsageLogRepoSuite) TestAPIKeyDashboardAnalyticsParity() {
 	want, err = s.repo.GetAPIKeyDashboardStats(s.ctx, key.ID)
 	s.Require().NoError(err)
 	s.Require().Equal(want, got)
+}
+
+// TestPersonalDashboardExcludesTeamAttributionAfterMembershipChange records personal
+// and team usage before the actor becomes team owner. Both reads must retain
+// only persisted personal rows, including key counts and recent token rates.
+func (s *UsageLogRepoSuite) TestPersonalDashboardExcludesTeamAttributionAfterMembershipChange() {
+	owner := mustCreateUser(s.T(), s.client, &identity.User{Email: "personal-dashboard@test.local"})
+	member := mustCreateUser(s.T(), s.client, &identity.User{Email: "personal-dashboard-member@test.local"})
+	p := mustCreateProvider(s.T(), s.client, &provider.Record{Name: "personal-dashboard"})
+	team, err := s.client.Team.Create().SetName("personal-dashboard-team").SetStatus("active").SetMemberLimit(10).Save(s.ctx)
+	s.Require().NoError(err)
+	personal := mustCreateApiKey(s.T(), s.client, &apikey.APIKey{UserID: owner.ID, Key: "personal-dashboard-personal"})
+	ownerTeam := mustCreateApiKey(s.T(), s.client, &apikey.APIKey{UserID: owner.ID, TeamID: &team.ID, Key: "personal-dashboard-team"})
+	memberTeam := mustCreateApiKey(s.T(), s.client, &apikey.APIKey{UserID: member.ID, TeamID: &team.ID, Key: "personal-dashboard-member"})
+	at := time.Now().UTC()
+	for i, key := range []*apikey.APIKey{personal, ownerTeam, memberTeam} {
+		_, err = s.repo.Create(s.ctx, &usage.UsageLog{
+			UserID: key.UserID, BillingUserID: owner.ID, TeamID: key.TeamID,
+			APIKeyID: key.ID, ProviderID: p.ID, RequestID: key.Key,
+			Model: "personal-dashboard", CreatedAt: at,
+			InputTokens: 10 + i*100, OutputTokens: 20 + i*100,
+			ActualCost: 0.1 + float64(i), TotalCost: 0.1 + float64(i),
+		})
+		s.Require().NoError(err)
+	}
+	want, err := s.repo.GetPersonalDashboardStats(s.ctx, owner.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(int64(1), want.TotalAPIKeys)
+	s.Require().Equal(int64(1), want.ActiveAPIKeys)
+	s.Require().Equal(int64(1), want.TotalRequests)
+	s.Require().Equal(int64(30), want.TotalTokens)
+	s.Require().Equal(int64(6), want.Tpm)
+	s.Require().InDelta(0.1, want.TotalActualCost, 0.000001)
+	_, err = s.client.TeamMembership.Create().SetTeamID(team.ID).SetUserID(owner.ID).SetRole("owner").Save(s.ctx)
+	s.Require().NoError(err)
+	// Publishing ownership after the first read must not widen any component of
+	// a personal dashboard; query scope remains tied to each row's stored attribution.
+	got, err := s.repo.GetPersonalDashboardStats(s.ctx, owner.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(want, got)
+	broad, err := s.repo.GetUserDashboardStats(s.ctx, owner.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(int64(3), broad.TotalRequests)
 }

@@ -7,33 +7,36 @@ import (
 
 // query_cache.go constructs administrator usage-statistics cache keys and loads
 // shared results.
-// Administrator usage statistics share a thirty-second snapshot by an encoded
-// subset of their query filters. UTC RFC3339 strings make equivalent offsets
+// Administrator usage statistics share a thirty-second snapshot under encoded
+// query filters. UTC RFC3339 strings make equivalent offsets
 // share time keys at second precision, while nil time bounds remain empty and
 // optional pointer selectors retain their JSON null or concrete values.
 //
-// The key represents the administrator handler's filter shape.
-// IncludeOwnedTeam, PersonalOnly, ModelFilterSource, and subsecond time
-// precision are absent from it, so other callers keep those inputs consistent
-// across requests that can share a key. Query execution and per-waiter
-// cancellation belong to querycache; callers keep captured filter pointers
-// unchanged until the shared load finishes.
+// The key retains personal-only and owned-team restrictions as independent
+// selectors, preventing a prior broader result from satisfying a narrower
+// request. Model selection also retains its interpretation source. Subsecond
+// time precision remains absent from this administrative snapshot key.
+// Query execution and per-waiter cancellation belong to querycache; callers
+// keep captured filter pointers unchanged until the shared load finishes.
 
 // usageStatsCacheKeyData identifies the filters for the 30-second admin usage
 // statistics cache.
 type usageStatsCacheKeyData struct {
-	RequestSource  string `json:"request_source"`  // requested customer or system source
-	RequestID      string `json:"request_id"`      // request lookup text selector
-	EndpointSource string `json:"endpoint_source"` // selected endpoint chart dimension
-	StartTime      string `json:"start_time"`      // UTC RFC3339 range start
-	EndTime        string `json:"end_time"`        // UTC RFC3339 range end
-	UserID         int64  `json:"user_id"`         // acting user scope selector
-	APIKeyID       int64  `json:"api_key_id"`      // API key scope selector
-	ProviderID     int64  `json:"provider_id"`     // execution provider scope selector
-	GroupID        int64  `json:"group_id"`        // routed group scope selector
-	TeamID         int64  `json:"team_id"`         // team scope selector value
-	Model          string `json:"model"`           // model text filter value
-	BillingMode    string `json:"billing_mode"`    // recorded billing mode selector
+	RequestSource     string `json:"request_source"`      // requested customer or system source
+	RequestID         string `json:"request_id"`          // request lookup text selector
+	EndpointSource    string `json:"endpoint_source"`     // selected endpoint chart dimension
+	StartTime         string `json:"start_time"`          // UTC RFC3339 range start
+	EndTime           string `json:"end_time"`            // UTC RFC3339 range end
+	UserID            int64  `json:"user_id"`             // acting user scope selector
+	APIKeyID          int64  `json:"api_key_id"`          // API key scope selector
+	ProviderID        int64  `json:"provider_id"`         // execution provider scope selector
+	GroupID           int64  `json:"group_id"`            // routed group scope selector
+	TeamID            int64  `json:"team_id"`             // team scope selector value
+	IncludeOwnedTeam  bool   `json:"include_owned_team"`  // additional owner-visible team records
+	PersonalOnly      bool   `json:"personal_only"`       // persisted team exclusion requirement
+	Model             string `json:"model"`               // model text filter value
+	ModelFilterSource string `json:"model_filter_source"` // interpreted model selector dimension
+	BillingMode       string `json:"billing_mode"`        // recorded billing mode selector
 	// RequestType, Stream, BillingType, and NativeCompactionV2 retain nil as
 	// an absent selector and encode supplied values separately, including false
 	// or zero values that still request filtering.
@@ -48,11 +51,11 @@ type usageStatsCacheKeyData struct {
 // RFC3339 text at second precision so differing offsets for that instant share
 // a key.
 //
-// Optional pointer filters retain absent versus supplied values. The key omits
-// IncludeOwnedTeam, PersonalOnly, ModelFilterSource, and subsecond precision;
-// callers requiring those distinctions keep them fixed or choose a separate
-// query path. ExactTotal governs listing pagination and is absent from this
-// statistics key.
+// Optional pointer filters retain absent versus supplied values. Resource-scope
+// restrictions and the model's interpretation source each produce independent
+// keys, so cached broader results cannot satisfy personal-only queries.
+// Subsecond precision remains omitted; ExactTotal governs listing pagination
+// and is absent from this statistics key.
 func usageStatsCacheKey(filters UsageLogFilters) string {
 	// RFC3339 drops fractional seconds from both bounds; nearby request-time
 	// cutoffs can therefore reuse the same administrative snapshot.
@@ -75,7 +78,10 @@ func usageStatsCacheKey(filters UsageLogFilters) string {
 		ProviderID:         filters.ProviderID,
 		GroupID:            filters.GroupID,
 		TeamID:             filters.TeamID,
+		IncludeOwnedTeam:   filters.IncludeOwnedTeam,
+		PersonalOnly:       filters.PersonalOnly,
 		Model:              filters.Model,
+		ModelFilterSource:  filters.ModelFilterSource,
 		BillingMode:        filters.BillingMode,
 		RequestType:        filters.RequestType,
 		Stream:             filters.Stream,

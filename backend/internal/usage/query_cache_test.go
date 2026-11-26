@@ -10,7 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Concurrent statistics reads can share a query while the first caller
+// query_cache_test.go checks shared statistics cancellation and resource-scope
+// isolation. Concurrent reads can share a query while the first caller
 // cancels its own wait. The blocking repository announces entry and waits for
 // an explicit release or shared-context cancellation, and the second context
 // announces when querycache reaches its cancellation select.
@@ -31,6 +32,12 @@ type statsCancellationRepo struct {
 	started chan struct{} // first loader entry signal
 	release chan struct{} // explicit shared loader completion signal
 	calls   atomic.Int32  // atomic shared loader invocation count
+}
+
+// scopedStatsRepo distinguishes broader counters from explicitly personal query results.
+type scopedStatsRepo struct {
+	UsageLogRepository     // unused repository methods fail without setup
+	calls              int // recorded scope-specific query count
 }
 
 // joinedStatsContext observes querycache waiter registration through the
@@ -68,6 +75,13 @@ func TestUsageStatsCacheKey_StableAndDistinct(t *testing.T) {
 	withTeam := base
 	withTeam.TeamID = 11
 	require.NotEqual(t, k1, usageStatsCacheKey(withTeam), "different team must change key")
+	for _, scoped := range []UsageLogFilters{
+		{StartTime: &start, EndTime: &end, Model: "claude-3", PersonalOnly: true},
+		{StartTime: &start, EndTime: &end, Model: "claude-3", IncludeOwnedTeam: true},
+		{StartTime: &start, EndTime: &end, Model: "claude-3", ModelFilterSource: ModelSourceRequested},
+	} {
+		require.NotEqual(t, k1, usageStatsCacheKey(scoped), "resource and model interpretation must remain distinct")
+	}
 	keys := map[string]bool{k1: true}
 	for _, source := range []string{"inbound", "upstream", "path"} {
 		filtered := base
@@ -76,6 +90,38 @@ func TestUsageStatsCacheKey_StableAndDistinct(t *testing.T) {
 		require.False(t, keys[key])
 		keys[key] = true
 	}
+}
+
+// GetStatsWithFilters returns distinct totals for personal and broader scope.
+// Calls are synchronous in this fixture, and the service copies each result
+// before exposing it through the query cache to its caller.
+func (r *scopedStatsRepo) GetStatsWithFilters(_ context.Context, filters UsageLogFilters) (*UsageStats, error) {
+	r.calls++
+	if filters.PersonalOnly {
+		return &UsageStats{TotalRequests: 1}, nil
+	}
+	return &UsageStats{TotalRequests: 100}, nil
+}
+
+// TestStatsCacheDoesNotReuseBroaderEvidenceForPersonalScope warms the broader
+// snapshot before reading personal counters for the same actor. The personal
+// read must load separately and reuse only its own subsequent cached result.
+func TestStatsCacheDoesNotReuseBroaderEvidenceForPersonalScope(t *testing.T) {
+	repo := &scopedStatsRepo{}
+	service := NewUsageService(repo)
+	broad, _, err := service.GetStatsCached(context.Background(), UsageLogFilters{UserID: 42, IncludeOwnedTeam: true})
+	require.NoError(t, err)
+	require.Equal(t, int64(100), broad.TotalRequests)
+	filters := UsageLogFilters{UserID: 42, PersonalOnly: true}
+	personal, hit, err := service.GetStatsCached(context.Background(), filters)
+	require.NoError(t, err)
+	require.False(t, hit)
+	require.Equal(t, int64(1), personal.TotalRequests)
+	personal, hit, err = service.GetStatsCached(context.Background(), filters)
+	require.NoError(t, err)
+	require.True(t, hit)
+	require.Equal(t, int64(1), personal.TotalRequests)
+	require.Equal(t, 2, repo.calls)
 }
 
 // GetStatsWithFilters announces the first repository call and waits for

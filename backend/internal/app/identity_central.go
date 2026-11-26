@@ -32,7 +32,7 @@ import (
 // Independent-continuity policy fields remain empty until a native provider profile qualifies.
 func provideCentralIdentity(cfg *config.Config, db *sql.DB, graph *identityAuthGraph, users *identity.UserService, settings *identityAuthSettings, totp *identity.TotpService, cipher identity.SecretEncryptor) *identityhttp.CentralHandler {
 	c := cfg.CentralIdentity
-	handler := &identityhttp.CentralHandler{Options: identityhttp.CentralHTTPOptions{Origin: c.Origin, ProviderName: c.ProviderName, TestLoopback: c.TestLoopback, Access: centralRouteAccess}, Auth: graph.Core, Users: users, BindingSettings: settings}
+	handler := &identityhttp.CentralHandler{Options: identityhttp.CentralHTTPOptions{Origin: c.Origin, ProviderName: c.ProviderName, TestLoopback: c.TestLoopback, Access: centralRouteAccess, BackendMode: settings.IsBackendModeEnabled}, Auth: graph.Core, Users: users, BindingSettings: settings}
 	if !c.Enabled {
 		return handler
 	}

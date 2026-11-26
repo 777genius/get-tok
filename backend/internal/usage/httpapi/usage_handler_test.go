@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/TokenFlux/TokenRouter/internal/apikey"
+	"github.com/TokenFlux/TokenRouter/internal/identity"
 	"github.com/TokenFlux/TokenRouter/internal/identity/httpapi/authctx"
 	"github.com/TokenFlux/TokenRouter/internal/pkg/pagination"
 	"github.com/TokenFlux/TokenRouter/internal/pkg/timezone"
@@ -20,7 +22,7 @@ import (
 	"github.com/TokenFlux/TokenRouter/internal/usage/httpapi/ports"
 )
 
-// User usage handlers combine authenticated actor scope with optional report
+// usage_handler_test.go checks authenticated actor scope with optional report
 // selectors and metric visibility. Capture fixtures expose the filters and
 // sort values passed to storage, while encoded response assertions check user
 // costs, client IP and omission of administrator-only chart and routing data.
@@ -73,6 +75,10 @@ type userUsageRepoCapture struct {
 	statsFilters             usage.UsageLogFilters       // captured complete user statistics selectors
 	trendFilters             usage.UsageLogFilters       // captured user trend selectors
 	groupFilters             usage.UsageLogFilters       // captured user group selectors
+	modelFilters             usage.UsageLogFilters       // captured user model selectors
+	personalDashboardCalls   int                         // recorded personal dashboard calls
+	broadDashboardCalls      int                         // recorded owner-visible dashboard calls
+	record                   *usage.UsageLog             // configured direct detail record
 	listRows                 []usage.UsageLog            // configured shared usage record rows
 	stats                    *usage.UsageStats           // configured shared usage summary pointer
 	modelStats               []usage.ModelStat           // configured shared model grouping rows
@@ -92,6 +98,109 @@ type usageRankingRepoCapture struct {
 	usage.UsageLogRepository                          // unused usage repository method slots
 	called                   bool                     // captured query invocation flag
 	sortBy                   usage.UsageRankingSortBy // captured ranking order metric
+}
+
+// GetPersonalDashboardStats records selection of the persisted personal reader.
+// The fixed result distinguishes this capability from the broader legacy
+// dashboard; tests invoke handlers synchronously before inspecting the call count.
+func (s *userUsageRepoCapture) GetPersonalDashboardStats(context.Context, int64) (*usage.UserDashboardStats, error) {
+	s.personalDashboardCalls++
+	return &usage.UserDashboardStats{TotalRequests: 1}, nil
+}
+
+// GetUserDashboardStats records selection of the legacy owner-visible dashboard.
+// Its distinct total exposes an accidental broader fallback to an ordinary
+// central session, and the caller reads the count after synchronous handling.
+func (s *userUsageRepoCapture) GetUserDashboardStats(context.Context, int64) (*usage.UserDashboardStats, error) {
+	s.broadDashboardCalls++
+	return &usage.UserDashboardStats{TotalRequests: 100}, nil
+}
+
+// GetByID returns the configured persisted usage detail for scope tests.
+// The returned record remains shared with the fixture; tests configure it before
+// dispatch and do not mutate its actor or team attribution during handling.
+func (s *userUsageRepoCapture) GetByID(context.Context, int64) (*usage.UsageLog, error) {
+	return s.record, nil
+}
+
+// GetModelStatsWithUsageFiltersBySource captures the complete model query scope.
+// The configured result is shared with the fixture; synchronous handler tests
+// retain it unchanged while inspecting the selectors sent to the reader.
+func (s *userUsageRepoCapture) GetModelStatsWithUsageFiltersBySource(_ context.Context, _, _ time.Time, filters usage.UsageLogFilters, _ string) ([]usage.ModelStat, error) {
+	s.modelFilters = filters
+	return s.modelStats, nil
+}
+
+// TestCentralUsageReportsKeepPersonalScope submits hostile team selectors under
+// an ordinary central session. Every unified report must retain personal-only
+// visibility and the new dashboard must avoid the owner-visible reader entirely.
+func TestCentralUsageReportsKeepPersonalScope(t *testing.T) {
+	repo := &userUsageRepoCapture{}
+	handler := NewUsageHandler(usage.NewUsageService(repo), nil, nil, nil, timezone.NewCalendar(time.UTC))
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		authctx.SetPrincipal(c, identity.Principal{UserID: 42, CredentialKind: "central"}, 1, "fixture@example.invalid")
+		authctx.SetCentralAccess(c, func(class identity.CentralAccessClass) error {
+			if class == identity.CentralAccessOrdinary {
+				return nil
+			}
+			return identity.ErrCentralProofRequired
+		})
+	})
+	RegisterUserRoutes(router.Group(""), handler, func(c *gin.Context) { c.Next() })
+	for _, path := range []string{"/usage", "/usage/stats", "/usage/dashboard/trend", "/usage/dashboard/models", "/usage/dashboard/snapshot-v2"} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path+"?include_groups=true&include_group_stats=true&api_key_id=17&team_id=7&include_owned_team=true&personal_only=false", nil))
+		require.Equal(t, http.StatusOK, recorder.Code, path+recorder.Body.String())
+	}
+	for _, filter := range []usage.UsageLogFilters{repo.listFilters, repo.statsFilters, repo.trendFilters, repo.modelFilters, repo.groupFilters} {
+		require.Equal(t, int64(42), filter.UserID)
+		require.Equal(t, int64(17), filter.APIKeyID)
+		require.True(t, filter.PersonalOnly)
+		require.False(t, filter.IncludeOwnedTeam)
+		require.Zero(t, filter.TeamID)
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/usage/dashboard/stats", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, 1, repo.personalDashboardCalls)
+	require.Zero(t, repo.broadDashboardCalls)
+}
+
+// TestCentralUsageRejectsUnscopedReadersAndStoredTeamDetails checks ordinary
+// sessions against readers without a personal contract and a stored team row.
+// Denial remains forbidden and leaves the browser's valid session cookie intact.
+func TestCentralUsageRejectsUnscopedReadersAndStoredTeamDetails(t *testing.T) {
+	teamID := int64(7)
+	repo := &userUsageRepoCapture{record: &usage.UsageLog{UserID: 42, TeamID: &teamID}}
+	handler := NewUsageHandler(usage.NewUsageService(repo), nil, nil, nil, timezone.NewCalendar(time.UTC))
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		authctx.SetPrincipal(c, identity.Principal{UserID: 42, CredentialKind: "central"}, 1, "fixture@example.invalid")
+		authctx.SetCentralAccess(c, func(class identity.CentralAccessClass) error {
+			if class == identity.CentralAccessOrdinary {
+				return nil
+			}
+			return identity.ErrCentralProofRequired
+		})
+	})
+	RegisterUserRoutes(router.Group(""), handler, func(c *gin.Context) { c.Next() })
+	for _, request := range []struct {
+		method string // submitted HTTP request method
+		path   string // protected usage route path
+	}{
+		{http.MethodGet, "/usage/1"},
+		{http.MethodGet, "/usage/errors"},
+		{http.MethodGet, "/usage/errors/1"},
+		{http.MethodGet, "/user/api-keys/1/usage/daily"},
+		{http.MethodPost, "/usage/dashboard/api-keys-usage"},
+	} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(request.method, request.path, strings.NewReader("{}")))
+		require.Equal(t, http.StatusForbidden, recorder.Code, request.path)
+		require.Contains(t, recorder.Body.String(), "CENTRAL_PROOF_REQUIRED")
+		require.Empty(t, recorder.Header().Values("Set-Cookie"))
+	}
 }
 
 // GetUsageTrendWithFilters captures range, granularity and user/key arguments

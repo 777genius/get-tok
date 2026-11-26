@@ -122,7 +122,7 @@ type CentralSessionStore interface {
 	// PublishAndRead serializes monotone status publication and reloads the session
 	// with current revocation and local account state before request admission.
 	PublishAndRead(context.Context, string, CentralStatusEvidence) (CentralSession, CentralStatusEvidence, *User, error)
-	// RevokeSession persists local logout before the browser cookie is removed.
+	// RevokeSession persists local logout before the browser reports its success.
 	// Repeated revocation is harmless; storage failure remains an explicit error.
 	RevokeSession(context.Context, string, time.Time) error
 	// RevokeUserSessions invalidates local human sessions for the supplied owner.
@@ -266,14 +266,23 @@ func (f *CentralFlow) Finish(ctx context.Context, state, browser, code string) (
 		return CentralFinishResult{}, ErrCentralBindingDisabled
 	}
 	token, err := f.Provider.ExchangeCode(ctx, f.Options.OIDC, code, f.Options.OIDC.RedirectURL, intent.Verifier)
+	if errors.Is(err, ErrCentralUnavailable) {
+		return CentralFinishResult{}, ErrCentralUnavailable
+	}
 	if err != nil || token == nil || !strings.EqualFold(token.TokenType, "Bearer") || token.AccessToken == "" || token.IDToken == "" || len(token.AccessToken) > 16384 || len(token.IDToken) > 16384 {
 		return CentralFinishResult{}, ErrCentralSessionExpired
 	}
 	claims, err := f.Provider.ValidateIDToken(ctx, f.Options.OIDC, token.IDToken, intent.Nonce)
+	if errors.Is(err, ErrCentralUnavailable) {
+		return CentralFinishResult{}, ErrCentralUnavailable
+	}
 	if err != nil || claims == nil || claims.AuthenticatedAt == nil || !centralIdentifier(claims.Subject) || claims.Issuer != intent.Issuer {
 		return CentralFinishResult{}, ErrCentralSessionExpired
 	}
 	info, err := f.Provider.FetchUserInfo(ctx, f.Options.OIDC, token)
+	if errors.Is(err, ErrCentralUnavailable) {
+		return CentralFinishResult{}, ErrCentralUnavailable
+	}
 	if err != nil || info == nil || info.Subject != claims.Subject {
 		return CentralFinishResult{}, ErrCentralSessionExpired
 	}
@@ -376,7 +385,7 @@ func (f *CentralFlow) VerifyLegacyOwner(ctx context.Context, userID int64, passw
 		return nil, ErrCentralBindingDisabled
 	}
 	user, err := f.Auth.Users.GetByID(ctx, userID)
-	if err != nil || !user.IsActive() || user.CentralManaged || !user.TotpEnabled || user.TotpEnabledAt == nil || !f.Auth.CheckPassword(password, user.PasswordHash) {
+	if err != nil || user == nil || !user.IsActive() || user.CentralManaged || !user.TotpEnabled || user.TotpEnabledAt == nil || user.TotpEnabledAt.IsZero() || user.TotpEnabledAt.After(f.now()) || !f.Auth.CheckPassword(password, user.PasswordHash) {
 		return nil, ErrCentralProofRequired
 	}
 	fingerprint := CentralOwnerFingerprint(user)
@@ -384,7 +393,7 @@ func (f *CentralFlow) VerifyLegacyOwner(ctx context.Context, userID int64, passw
 		return nil, ErrCentralProofRequired
 	}
 	fresh, err := f.Auth.Users.GetByID(ctx, userID)
-	if err != nil || !fresh.IsActive() || fresh.CentralManaged || CentralOwnerFingerprint(fresh) != fingerprint {
+	if err != nil || fresh == nil || !fresh.IsActive() || fresh.CentralManaged || CentralOwnerFingerprint(fresh) != fingerprint {
 		return nil, ErrCentralProofRequired
 	}
 	return &CentralOwnerProof{LocalUserID: userID, CredentialFingerprint: fingerprint, VerifiedAt: f.now()}, nil
@@ -456,11 +465,13 @@ func (f *CentralFlow) prepareRegistration(ctx context.Context, intent CentralLog
 // Password reset, mailbox change, TOTP replacement or enrollment changes invalidate it.
 func CentralOwnerFingerprint(user *User) string {
 	data, err := json.Marshal(struct {
-		Version int64
-		Factor  *string
-		Enabled bool
-		Since   *time.Time
-	}{ResolvedTokenVersion(user), user.TotpSecretEncrypted, user.TotpEnabled, user.TotpEnabledAt})
+		Version      int64      // existing resolved credential revision
+		Email        string     // normalized mailbox included without truncating its digest
+		PasswordHash string     // full current password hash, retained only inside this digest input
+		Factor       *string    // exact encrypted factor representation
+		Enabled      bool       // current enrollment flag
+		Since        *time.Time // original enrollment timestamp
+	}{ResolvedTokenVersion(user), strings.ToLower(strings.TrimSpace(user.Email)), user.PasswordHash, user.TotpSecretEncrypted, user.TotpEnabled, user.TotpEnabledAt})
 	if err != nil {
 		return ""
 	}

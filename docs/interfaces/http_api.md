@@ -8,6 +8,7 @@
 - [路由族](#路由族)：URL 前缀、认证方式和负责的模块。
 - [支付管理恢复](#payment_admin_recovery)：订单强制过期和退款查单。
 - [身份登录接口](#身份登录接口)：修改 OAuth start、人机验证和 One Tap 时读取。
+- [共享身份浏览器接口](#shared_identity_browser)：修改 opaque cookie、CSRF、中央登录和回调时读取。
 - [创作台接口](#创作台接口)：修改工作区、任务和输出交付时读取。
 - [提供商管理接口](#提供商管理接口)：修改批量管理、测试、诊断和导入时读取。
 - [备份与维护接口](#备份与维护接口)：修改备份和系统操作时读取。
@@ -27,6 +28,29 @@
 - [产品名称兼容](#product_name_compatibility)：修改新旧导入标识、请求头和浏览器状态时读取。
 
 新增创作台路由时，先读[创作台](../domains/creative_studio.md)，核对生命周期、幂等和留存规则。
+
+<a id="shared_identity_browser"></a>
+## 共享身份浏览器接口
+
+共享身份由 `identity/httpapi.CentralHandler` 提供，app 组合既有用户服务、PostgreSQL store、OIDC transport 和版本固定的 Identity Connect client。以下路由使用现有面板 envelope。浏览器只能获得现有用户资料、opaque HttpOnly cookie 和独立的 CSRF proof；provider access、refresh、ID token 及 workload token 都留在服务端。
+
+| 方法与路径 | 输入或结果 | 边界 |
+| --- | --- | --- |
+| `GET /api/v1/auth/central/config` | `enabled`、`provider_name`、`providers`、`legacy_binding_enabled` | 只返回展示和能力信息 |
+| `POST /api/v1/auth/central/start` | `intent: login\|register\|bind`，可选 `provider`、`invitation_code` 和现有人机验证字段；返回 `authorization_url` | 精确 Origin/Host，未知字段拒绝；bind 才允许显式的旧 Bearer 加 TEST 密码/TOTP proof |
+| `GET /api/v1/auth/central/callback` | provider code、state 和 browser transaction cookie | 原子消费一次性事务；nonce、PKCE、issuer、主体和中央 admission 校验成功后才写 session cookie |
+| `GET /api/v1/auth/central/session` | `user`、`csrf_token`、RFC3339 `expires_at`、`auth_mode: central` | 读取当前中央状态；bootstrap 可不带 CSRF，已带的 CSRF 必须匹配 |
+| `POST /api/v1/auth/central/logout` | opaque cookie、`X-CSRF-Token` | 精确 Origin；在本地数据库撤销当前浏览器 session，不依赖 Keycloak 可用性 |
+
+回调只跳转到 `/auth/central/callback`。失败时 `error` 限于 `account_not_linked`、`account_conflict`、`temporarily_unavailable`、`access_denied`、`authentication_failed`；授权码和 token 不进入前端 callback query 或 fragment。`login` 不建号，`register` 不按相同邮箱接管旧账户，既有账户迁移见[身份领域](../domains/identity_and_tenancy.md#shared_identity_sessions)。
+
+生产 cookie 为 `__Host-gettok-central` 和 `__Host-gettok-central-login`，带 `Secure`、`HttpOnly`、`SameSite=Lax`、`Path=/` 且无 Domain。loopback TEST 使用不同名称 `gettok-central-test` 与 `gettok-central-login-test`。认证响应使用 `Cache-Control: no-store`。opaque session 与 legacy Bearer 同时出现时拒绝混合身份；只有数据库确认该 cookie 已撤销或过期后，显式的 legacy Bearer 才能进入既有校验，已中央管理的用户仍会被拒绝。
+
+central 模式的前端把 CSRF 只保存在内存，并在所有已认证请求上发送 `X-CSRF-Token`，包括 GET。受保护路由缺少或带错 proof 都返回 403，避免另一个标签页替换 cookie 后，旧页面把新账户的数据放入旧用户界面。写请求还必须通过 Origin 检查。专用的 `/central/session` bootstrap 可以不带 proof；若提供 proof，仍必须匹配。`/auth/me` 不能充当隐式 bootstrap。
+
+退出成功只提交撤销，不发删除 session cookie 的 `Set-Cookie`。这样延迟返回的旧退出请求不会清除另一次新登录的 cookie。已撤销 cookie 最迟随原 session 的 5 分钟绝对期限过期；网络或数据库错误时，前端保持可重试状态，不宣称已退出。全部 session 撤销只作用于本地 human sessions，API Key 和 MCP machine credentials 使用各自的生命周期。
+
+中央状态不可用或过期返回 503 `CENTRAL_UNAVAILABLE`；失效的身份或 session 返回 401；需要更强证明时返回 403 `CENTRAL_PROOF_REQUIRED`，有效的普通 session 不因此被删除。资源 owner、团队角色和余额规则继续由各产品模块决定。生产时限及恢复规则见[共享身份部署](../operations/shared_identity_deployment.md)。
 
 ## 全局入口
 

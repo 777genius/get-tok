@@ -43,7 +43,7 @@ func (c *CentralOIDCClient) ExchangeCode(ctx context.Context, options OIDCOption
 	if err != nil {
 		return nil, identity.ErrCentralEvidenceInvalid
 	}
-	request.SetBasicAuth(options.ClientID, options.ClientSecret)
+	request.SetBasicAuth(url.QueryEscape(options.ClientID), url.QueryEscape(options.ClientSecret))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	data, err := c.read(request)
 	if err != nil {

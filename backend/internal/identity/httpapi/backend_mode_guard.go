@@ -61,6 +61,12 @@ func backendModeAllowsAuthPath(path string) bool {
 		"/auth/passkey/login/finish",
 		"/auth/logout",
 		"/auth/refresh",
+		// Existing opaque sessions can still bootstrap their CSRF proof and
+		// withdraw access. New central login/registration stays unavailable in
+		// backend mode until its independent administrator profile is qualified.
+		"/auth/central/config",
+		"/auth/central/session",
+		"/auth/central/logout",
 	} {
 		if strings.HasSuffix(path, suffix) {
 			return true

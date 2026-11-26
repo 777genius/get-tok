@@ -13,6 +13,7 @@ import (
 
 	dbent "github.com/TokenFlux/TokenRouter/ent"
 	"github.com/TokenFlux/TokenRouter/ent/authidentity"
+	dbuser "github.com/TokenFlux/TokenRouter/ent/user"
 	billingpostgres "github.com/TokenFlux/TokenRouter/internal/billing/postgres"
 	identitycore "github.com/TokenFlux/TokenRouter/internal/identity"
 	infraerrors "github.com/TokenFlux/TokenRouter/internal/pkg/apperror"
@@ -100,20 +101,24 @@ func (s *AuthState) ApplyProviderDefaultSettingsOnFirstBind(
 }
 
 // AuthApplyProviderDefaultSettingsOnFirstBind records the enabled first-bind
-// claim before applying provider entitlements. Supply the caller transaction
-// covering the marker and later grant participants.
+// claim before applying provider entitlements. It joins the caller transaction
+// or delegates to the wrapper that owns the marker and grant transaction.
 //
 // The unique account/provider/first_bind insert uses do-nothing conflict
 // handling; zero affected rows skip every grant write. A newly inserted claim
 // permits configured balance, concurrency, and subscription defaults in
-// sequence. This method selects the injected transaction client but creates no
-// rollback scope itself, so callers keep claim and entitlement errors inside
-// their shared transaction.
+// sequence. The current account row is locked before the claim so a delayed
+// legacy provider callback cannot grant entitlements after central ownership
+// activation. Errors remain inside the shared transaction and require rollback
+// by its owner, including the wrapper when no transaction was supplied.
 func (s *AuthState) AuthApplyProviderDefaultSettingsOnFirstBind(
 	ctx context.Context,
 	userID int64,
 	providerType string,
 ) error {
+	if dbent.TxFromContext(ctx) == nil {
+		return s.ApplyProviderDefaultSettingsOnFirstBind(ctx, userID, providerType)
+	}
 	providerDefaults, enabled, err := s.Settings.ResolveAuthSourceGrantSettings(ctx, providerType, true)
 	if err != nil {
 		return fmt.Errorf("load auth source defaults: %w", err)
@@ -125,6 +130,15 @@ func (s *AuthState) AuthApplyProviderDefaultSettingsOnFirstBind(
 	client := s.entClient
 	if tx := dbent.TxFromContext(ctx); tx != nil {
 		client = tx.Client()
+	}
+	// Serialize legacy financial side effects with central ownership activation.
+	// A provider callback that passed an earlier login read cannot grant after binding.
+	current, err := client.User.Query().Where(dbuser.IDEQ(userID)).ForUpdate().Only(ctx)
+	if err != nil {
+		return err
+	}
+	if current.CentralManaged {
+		return identitycore.ErrCentralLoginRequired
 	}
 
 	// Insert the unique first-bind marker before entitlements and inspect its
@@ -378,9 +392,9 @@ func (s *AuthState) AuthEnsureEmailAuthIdentity(ctx context.Context, user *ident
 }
 
 // AuthEnsureEmailOAuthIdentity creates or refreshes one provider tuple for the
-// supplied account through the configured Ent client. Callers provide a
-// validated provider profile and a client participating in any required
-// transaction; this method uses that client directly.
+// supplied account through a joined or owned Ent transaction. The current user
+// row remains locked through provider persistence, preventing an older legacy
+// callback from writing a provider binding after central ownership activation.
 //
 // The type is normalized while key and subject are trimmed before ownership
 // lookup. A same-owner row receives replacement metadata, and another owner
@@ -389,6 +403,28 @@ func (s *AuthState) AuthEnsureEmailAuthIdentity(ctx context.Context, user *ident
 // name and avatar hints are applied. New rows receive those selected values
 // and the requested account ID.
 func (s *AuthState) AuthEnsureEmailOAuthIdentity(ctx context.Context, userID int64, input identitycore.EmailOAuthIdentityInput) error {
+	if s == nil || s.entClient == nil {
+		return identitycore.ErrServiceUnavailable
+	}
+	if dbent.TxFromContext(ctx) == nil {
+		tx, err := s.entClient.Tx(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := s.AuthEnsureEmailOAuthIdentity(dbent.NewTxContext(ctx, tx), userID, input); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	client := dbent.TxFromContext(ctx).Client()
+	current, err := client.User.Query().Where(dbuser.IDEQ(userID)).ForUpdate().Only(ctx)
+	if err != nil {
+		return err
+	}
+	if current.CentralManaged {
+		return identitycore.ErrCentralLoginRequired
+	}
 	metadata := map[string]any{
 		"email":          strings.TrimSpace(strings.ToLower(input.Email)),
 		"email_verified": input.EmailVerified,
@@ -407,7 +443,7 @@ func (s *AuthState) AuthEnsureEmailOAuthIdentity(ctx context.Context, userID int
 	providerType := identitycore.AuthNormalizeOAuthSignupSource(input.ProviderType)
 	providerKey := strings.TrimSpace(input.ProviderKey)
 	providerSubject := strings.TrimSpace(input.ProviderSubject)
-	identity, err := s.entClient.AuthIdentity.Query().
+	identity, err := client.AuthIdentity.Query().
 		Where(
 			authidentity.ProviderTypeEQ(providerType),
 			authidentity.ProviderKeyEQ(providerKey),
@@ -421,12 +457,12 @@ func (s *AuthState) AuthEnsureEmailOAuthIdentity(ctx context.Context, userID int
 		if identity.UserID != userID {
 			return infraerrors.Conflict("AUTH_IDENTITY_OWNERSHIP_CONFLICT", "auth identity already belongs to another user")
 		}
-		_, err = s.entClient.AuthIdentity.UpdateOneID(identity.ID).
+		_, err = client.AuthIdentity.UpdateOneID(identity.ID).
 			SetMetadata(metadata).
 			Save(ctx)
 		return err
 	}
-	_, err = s.entClient.AuthIdentity.Create().
+	_, err = client.AuthIdentity.Create().
 		SetUserID(userID).
 		SetProviderType(providerType).
 		SetProviderKey(providerKey).

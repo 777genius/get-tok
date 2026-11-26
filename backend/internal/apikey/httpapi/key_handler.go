@@ -11,6 +11,7 @@ import (
 	"github.com/TokenFlux/TokenRouter/internal/apikey"
 	"github.com/TokenFlux/TokenRouter/internal/apikey/httpapi/dto"
 	idempotencyhttp "github.com/TokenFlux/TokenRouter/internal/idempotency/httpapi"
+	"github.com/TokenFlux/TokenRouter/internal/identity"
 	"github.com/TokenFlux/TokenRouter/internal/identity/httpapi/authctx"
 	"github.com/TokenFlux/TokenRouter/internal/pkg/locale"
 	"github.com/TokenFlux/TokenRouter/internal/pkg/pagination"
@@ -33,6 +34,11 @@ import (
 // the generated replacement secret. Request routes rely on their configured
 // middleware for authentication, rate controls and auditing before these
 // handlers read the subject.
+// Central TEST sessions additionally need sensitive-operation continuity before
+// secret-bearing Key reads or writes. Payer option queries keep their explicit
+// personal scope; a team scope requires organizational continuity before the
+// service resolves the current team payer. These checks retain the service's
+// existing resource ownership rules and do not confer team membership.
 
 // APIKeyHandler serves user credential operations and payer-scoped
 // configuration choices with group presentation.
@@ -259,8 +265,13 @@ func ValidateAPIKeyUpdateRequest(req UpdateAPIKeyRequest) error {
 // pagination and localized group data. Search is trimmed and capped at 100
 // bytes, malformed group IDs are ignored, and scope is normalized before the
 // repository filter. Service errors are returned through the application
-// response.
+// response. Central callers require sensitive-operation continuity because the
+// returned records contain complete credentials, including a possible team Key.
+// @project-doc docs/domains/identity_and_tenancy.md#central_resource_scope
 func (h *APIKeyHandler[G]) List(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessSensitive) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -309,8 +320,12 @@ func (h *APIKeyHandler[G]) List(c *gin.Context) {
 // GetByID loads one visible credential for the authenticated subject and
 // presents localized group data. A differently owned Key uses the same
 // missing-key response as absence; parseable signed IDs reach the service,
-// while malformed input returns a bad request.
+// while malformed input returns a bad request. Central sessions require
+// sensitive-operation continuity before loading any secret-bearing record.
 func (h *APIKeyHandler[G]) GetByID(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessSensitive) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -348,8 +363,12 @@ func (h *APIKeyHandler[G]) GetByID(c *gin.Context) {
 // an unbound executor invokes the callback directly for fixtures. The service
 // performs final group, funding and credential checks. Successful
 // execution returns a localized Key response; service errors become the
-// executor's application error result.
+// executor's application error result. Central sessions require sensitive
+// continuity before entering the idempotency coordinator, including replay.
 func (h *APIKeyHandler[G]) Create(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessSensitive) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -414,8 +433,12 @@ func (h *APIKeyHandler[G]) Create(c *gin.Context) {
 // explicit zero or empty replacements. Empty expires_at sets ClearExpiration;
 // nonempty text uses RFC3339 parsing. The service determines final write masks,
 // ownership, binding and funding checks, then the handler presents its result
-// with request-localized group data.
+// with request-localized group data. Central sessions require sensitive
+// continuity before credential configuration or payer eligibility is consulted.
 func (h *APIKeyHandler[G]) Update(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessSensitive) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -492,8 +515,12 @@ func (h *APIKeyHandler[G]) Update(c *gin.Context) {
 // RotateCredential replaces an authenticated subject's eligible credential and
 // presents the returned secret. A nonpositive or malformed ID is rejected
 // early; ownership, managed-Key exclusion and storage conflicts come from the
-// service and use shared application error responses.
+// service and use shared application error responses. Central sessions need
+// sensitive continuity before a replacement credential can be generated.
 func (h *APIKeyHandler[G]) RotateCredential(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessSensitive) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -515,8 +542,12 @@ func (h *APIKeyHandler[G]) RotateCredential(c *gin.Context) {
 // Delete requests service tombstone deletion for the authenticated subject's
 // credential and returns a success message. Malformed ID or missing subject
 // stops early; parseable signed IDs and service ownership failures use the
-// existing service response path.
+// existing service response path. Central sessions need sensitive continuity
+// before any credential is loaded or its tombstone operation is requested.
 func (h *APIKeyHandler[G]) Delete(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessSensitive) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -549,7 +580,12 @@ func (h *APIKeyHandler[G]) Delete(c *gin.Context) {
 // The specialized presenter receives the current request context for its
 // localized or catalogue work. The base callback determines its own presentation
 // work, and caller-installed middleware establishes subject authorization.
+// Central personal queries retain ordinary access, while selecting the team
+// payer requires organizational continuity before resolving available groups.
 func (h *APIKeyHandler[G]) GetAvailableGroups(c *gin.Context) {
+	if !requirePayerScopeAccess(c) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -602,8 +638,12 @@ func (h *APIKeyHandler[G]) GetAvailableGroups(c *gin.Context) {
 // GetBillingOptions lists effective subscriptions offered for the authenticated
 // subject's requested payer scope. Team scope resolves the owner in the
 // service; the response copies applicable group IDs and uses service-localized
-// plan names.
+// plan names. Central team queries require organizational continuity before
+// the service reads the current payer's subscription choices.
 func (h *APIKeyHandler[G]) GetBillingOptions(c *gin.Context) {
+	if !requirePayerScopeAccess(c) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -658,8 +698,12 @@ func (h *APIKeyHandler[G]) getAvailableGroupCapacityMap(ctx context.Context, gro
 // GetUserGroupRates returns payer-specific group charge multipliers for the
 // authenticated subject's requested scope. Team scope resolves the current
 // owner, missing rate storage can produce nil data, and service errors use the
-// shared application response.
+// shared application response. Central team queries require organizational
+// continuity before the service selects the owner's private rates.
 func (h *APIKeyHandler[G]) GetUserGroupRates(c *gin.Context) {
+	if !requirePayerScopeAccess(c) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -673,4 +717,18 @@ func (h *APIKeyHandler[G]) GetUserGroupRates(c *gin.Context) {
 	}
 
 	response.Success(c, rates)
+}
+
+// requirePayerScopeAccess checks continuity before a query selects the team payer.
+// Scope normalization matches the service's case-insensitive team selector.
+// Personal queries retain the authenticated user's own grants and subscriptions;
+// missing organizational proof writes a forbidden response without clearing the session.
+func requirePayerScopeAccess(c *gin.Context) bool {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessOrdinary) {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Query("scope")), "team") {
+		return authctx.RequireCentralAccess(c, identity.CentralAccessOrganizational)
+	}
+	return true
 }

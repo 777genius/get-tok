@@ -360,7 +360,7 @@ func (r *Store) getUserDashboardStatsFromAnalytics(ctx context.Context, userID i
 	})
 	group.Go(func() error {
 		var performanceErr error
-		rpm, tpm, performanceErr = r.getPerformanceStatsForScope(groupCtx, userID, teamID)
+		rpm, tpm, performanceErr = r.getPerformanceStatsForScope(groupCtx, userID, teamID, false)
 		return performanceErr
 	})
 	if err := group.Wait(); err != nil {
@@ -392,15 +392,21 @@ func (r *Store) getUserDashboardStatsFromAnalytics(ctx context.Context, userID i
 // future-dated records participate. Input/output tokens determine text TPM,
 // cache tokens are excluded, and integer division discards fractional
 // per-minute counts before the dashboard receives them.
-func (r *Store) getPerformanceStatsForScope(ctx context.Context, userID, teamID int64) (int64, int64, error) {
+// Personal-only reads intersect both branches with stored team exclusion, even
+// if a caller supplies a positive team identifier alongside that restriction.
+func (r *Store) getPerformanceStatsForScope(ctx context.Context, userID, teamID int64, personalOnly bool) (int64, int64, error) {
 	var requests, tokens int64
+	personalCondition := ""
+	if personalOnly {
+		personalCondition = " AND team_id IS NULL"
+	}
 	err := scanSingleRow(ctx, r.sql, `
 		WITH scoped AS (
 			SELECT input_tokens, output_tokens FROM usage_logs
-			WHERE user_id = $1 AND created_at >= $3
+			WHERE user_id = $1 AND created_at >= $3`+personalCondition+`
 			UNION ALL
 			SELECT input_tokens, output_tokens FROM usage_logs
-			WHERE $2 > 0 AND team_id = $2 AND user_id <> $1 AND created_at >= $3
+			WHERE $2 > 0 AND team_id = $2 AND user_id <> $1 AND created_at >= $3`+personalCondition+`
 		)
 		SELECT COUNT(*), COALESCE(SUM(input_tokens + output_tokens), 0) FROM scoped
 	`, []any{userID, teamID, time.Now().Add(-5 * time.Minute)}, &requests, &tokens)

@@ -120,6 +120,11 @@ func TestBackendModeUserGuard(t *testing.T) {
 		role       *string
 		wantStatus int // expected HTTP response status
 	}{
+		{name: "central_capability_available", enabled: "true", path: "/api/v1/auth/central/config", wantStatus: http.StatusOK},
+		{name: "central_withdrawal_bootstrap_available", enabled: "true", path: "/api/v1/auth/central/session", wantStatus: http.StatusOK},
+		{name: "central_logout_available", enabled: "true", path: "/api/v1/auth/central/logout", wantStatus: http.StatusOK},
+		{name: "central_login_not_admitted", enabled: "true", path: "/api/v1/auth/central/start", wantStatus: http.StatusForbidden},
+		{name: "central_callback_not_admitted", enabled: "true", path: "/api/v1/auth/central/callback", wantStatus: http.StatusForbidden},
 		{
 			name:       "disabled_allows_all",
 			enabled:    "false",

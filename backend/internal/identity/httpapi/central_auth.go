@@ -26,8 +26,10 @@ import (
 // CSRF secret, both under no-store response policy.
 //
 // Cookie authentication is selected before legacy Bearer authentication, and
-// mixed credentials are rejected. Mutations require the configured exact origin
-// plus the session's CSRF secret; safe reads reject cross-origin browser access.
+// mixed credentials are rejected. Protected reads and mutations require the
+// session's CSRF secret, preventing another tab's cookie from silently changing
+// the displayed owner. Mutations also require the configured exact origin;
+// the dedicated session bootstrap permits the initial proof-free same-origin read.
 // Logout persists local revocation and leaves an inert cookie to expire, so a
 // delayed response cannot erase a newer login. It remains usable during an
 // upstream outage. Only an explicit loopback TEST configuration uses
@@ -43,9 +45,10 @@ const (
 
 // CentralHTTPOptions carries browser custody and product assurance classification.
 type CentralHTTPOptions struct {
-	Origin       string // exact configured browser origin
-	ProviderName string // display label independent of the broker alias
-	TestLoopback bool   // explicit local TEST cookie transport
+	Origin       string                     // exact configured browser origin
+	ProviderName string                     // display label independent of the broker alias
+	TestLoopback bool                       // explicit local TEST cookie transport
+	BackendMode  func(context.Context) bool // current panel restriction on new shared login
 	// Access classifies product resources after current identity was resolved.
 	// It performs no role grant; ordinary product authorization still runs afterward.
 	Access func(context.Context, int64, string, string) (identity.CentralAccessClass, error)
@@ -100,7 +103,8 @@ func (h *CentralHandler) Config(c *gin.Context) {
 			providers = append(providers, gin.H{"id": alias, "label": label})
 		}
 	}
-	response.Success(c, gin.H{"enabled": h.Flow != nil, "provider_name": h.Options.ProviderName, "providers": providers, "legacy_binding_enabled": h.Flow != nil && h.Flow.Options.TestBindingProfile == identity.CentralTestBindingProfile})
+	loginEnabled := h.Flow != nil && (h.Options.BackendMode == nil || !h.Options.BackendMode(c.Request.Context()))
+	response.Success(c, gin.H{"enabled": loginEnabled, "provider_name": h.Options.ProviderName, "providers": providers, "legacy_binding_enabled": loginEnabled && h.Flow.Options.TestBindingProfile == identity.CentralTestBindingProfile})
 }
 
 // Start validates exact origin, explicit intent and its existing admission gates.
@@ -187,7 +191,9 @@ func (h *CentralHandler) Callback(c *gin.Context) {
 	c.Redirect(http.StatusFound, "/auth/central/callback")
 }
 
-// Session bootstraps browser memory from current cookie and fresh authority status.
+// Session bootstraps browser memory from current cookie and fresh authority
+// status. Profile hydration uses the same local reader as the existing current
+// user endpoint, preserving group restrictions and avatar metadata after reload.
 func (h *CentralHandler) Session(c *gin.Context) {
 	centralNoStore(c)
 	if !h.enabled(c) || !h.browserOrigin(c, false) {
@@ -197,12 +203,21 @@ func (h *CentralHandler) Session(c *gin.Context) {
 	if !ok {
 		return
 	}
-	identities, err := h.Users.GetProfileIdentitySummaries(c.Request.Context(), verified.User.ID, verified.User)
+	user, err := h.Users.GetByID(c.Request.Context(), verified.User.ID)
 	if err != nil {
 		centralHTTPError(c, identity.ErrCentralUnavailable)
 		return
 	}
-	response.Success(c, gin.H{"user": UserProfileResponseFromService(verified.User, identities), "csrf_token": verified.Session.CSRFSecret, "expires_at": verified.Session.ExpiresAt, "auth_mode": "central"})
+	if !user.IsActive() || !user.CentralManaged {
+		centralHTTPError(c, identity.ErrCentralAccountInactive)
+		return
+	}
+	identities, err := h.Users.GetProfileIdentitySummaries(c.Request.Context(), user.ID, user)
+	if err != nil {
+		centralHTTPError(c, identity.ErrCentralUnavailable)
+		return
+	}
+	response.Success(c, gin.H{"user": UserProfileResponseFromService(user, identities), "csrf_token": verified.Session.CSRFSecret, "expires_at": verified.Session.ExpiresAt, "auth_mode": "central"})
 }
 
 // Logout revokes this local browser session without requiring a live identity provider.
@@ -278,7 +293,10 @@ func (h *CentralHandler) Wrap(legacy gin.HandlerFunc, administrator bool) gin.Ha
 		if !ok {
 			return
 		}
-		if !centralSafeMethod(c.Request.Method) && !identity.CentralCSRFMatches(verified.Session, c.GetHeader("X-CSRF-Token")) {
+		// A stale legacy tab can lose shared localStorage while retaining its old
+		// user view. Requiring the current session proof on reads too prevents the
+		// new cookie from silently changing that tab's authenticated owner.
+		if !identity.CentralCSRFMatches(verified.Session, c.GetHeader("X-CSRF-Token")) {
 			centralHTTPError(c, identity.ErrCentralProofRequired)
 			return
 		}
@@ -443,7 +461,7 @@ func centralHTTPError(c *gin.Context, err error) {
 	case errors.Is(err, identity.ErrCentralUnavailable), errors.Is(err, identity.ErrCentralEvidenceStale):
 		AbortWithError(c, http.StatusServiceUnavailable, "CENTRAL_UNAVAILABLE", "Shared authentication is temporarily unavailable")
 	case errors.Is(err, identity.ErrCentralProofRequired), errors.Is(err, identity.ErrCentralBindingDisabled):
-		AbortWithError(c, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", "This operation requires qualified account continuity proof")
+		AbortWithError(c, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", "Additional account verification is required for this action.")
 	case errors.Is(err, identity.ErrCentralConflict):
 		AbortWithError(c, http.StatusConflict, "CENTRAL_ACCOUNT_CONFLICT", "This identity cannot be attached to the selected account")
 	default:

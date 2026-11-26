@@ -45,9 +45,24 @@ func NewCentralSessionStore(db *sql.DB, client *dbent.Client, auth *AuthState, n
 }
 
 // SaveLogin stores a bounded encrypted browser intent without any plaintext PKCE.
-// A duplicate random state is an error and never replaces an earlier flow.
+// A duplicate random state is an error and never replaces an earlier flow. Each
+// start also removes at most one hundred long-expired intents and sessions;
+// retained bindings and sticky account fences are never cleanup candidates.
 func (s *CentralSessionStore) SaveLogin(ctx context.Context, flow identity.CentralLoginTransaction) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO central_identity_login_transactions
+	_, err := s.db.ExecContext(ctx, `WITH expired_intents AS (
+ DELETE FROM central_identity_login_transactions WHERE state_hash IN (
+  SELECT state_hash FROM central_identity_login_transactions
+  WHERE expires_at < $4::timestamptz - interval '1 hour'
+  ORDER BY expires_at LIMIT 100 FOR UPDATE SKIP LOCKED
+ )
+), expired_sessions AS (
+ DELETE FROM central_identity_sessions WHERE token_hash IN (
+  SELECT token_hash FROM central_identity_sessions
+  WHERE expires_at < $4::timestamptz - interval '24 hours'
+  ORDER BY expires_at LIMIT 100 FOR UPDATE SKIP LOCKED
+ )
+)
+INSERT INTO central_identity_login_transactions
  (state_hash,browser_hash,encrypted_intent,created_at,expires_at) VALUES ($1,$2,$3,$4,$5)`,
 		flow.StateDigest, flow.BrowserDigest, flow.Ciphertext, flow.CreatedAt, flow.ExpiresAt)
 	return centralStoreError(err)
@@ -121,7 +136,7 @@ func (s *CentralSessionStore) CompleteLogin(ctx context.Context, input identity.
 				return identity.CentralLoginCommit{}, centralStoreError(err)
 			}
 			current := UserFromEntity(user)
-			if !current.IsActive() || current.CentralManaged || !current.TotpEnabled || identity.CentralOwnerFingerprint(current) != proof.CredentialFingerprint {
+			if !current.IsActive() || current.CentralManaged || !current.TotpEnabled || current.TotpEnabledAt == nil || current.TotpEnabledAt.IsZero() || current.TotpEnabledAt.After(proof.VerifiedAt) || identity.CentralOwnerFingerprint(current) != proof.CredentialFingerprint {
 				return identity.CentralLoginCommit{}, identity.ErrCentralProofRequired
 			}
 			// Activate the permanent human-authentication fence in the same commit as
@@ -280,8 +295,9 @@ func (s *CentralSessionStore) PublishAndRead(ctx context.Context, digest string,
 	return session, merged, UserFromEntity(userEntity), nil
 }
 
-// RevokeSession commits the first logout timestamp before browser cookie removal.
-// Missing and already revoked sessions are successful idempotent cleanup outcomes.
+// RevokeSession commits the first logout timestamp before logout reports success.
+// Missing and already revoked sessions are successful idempotent outcomes. The
+// browser cookie remains inert until its existing expiration time.
 func (s *CentralSessionStore) RevokeSession(ctx context.Context, digest string, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE central_identity_sessions SET revoked_at=COALESCE(revoked_at,$2) WHERE token_hash=$1`, digest, now)
 	return centralStoreError(err)

@@ -13,11 +13,18 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/TokenFlux/TokenRouter/internal/apikey"
+	"github.com/TokenFlux/TokenRouter/internal/identity"
 	"github.com/TokenFlux/TokenRouter/internal/identity/httpapi/authctx"
 	"github.com/TokenFlux/TokenRouter/internal/routing"
 	"github.com/TokenFlux/TokenRouter/internal/routing/accessview"
 	response "github.com/TokenFlux/TokenRouter/internal/server/httpx"
 )
+
+// key_handler_test.go checks credential visibility, mutation admission and payer
+// options through the real HTTP handlers. Central ordinary sessions exercise
+// denied paths with no service bound, so a missing assurance check cannot be
+// hidden by a permissive repository fixture. Existing cases cover legacy
+// ownership, replacement conflicts and available personal group presentation.
 
 // rotationHTTPRepository records secret replacement calls and supplies an
 // optional write failure.
@@ -337,4 +344,103 @@ func TestAvailableGroupsOptionalModels(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCentralKeySecretsRequireSensitiveProof sends every secret-bearing route
+// using an ordinary central session. It requires a forbidden proof response
+// before service work and verifies that denial never clears the session cookie.
+func TestCentralKeySecretsRequireSensitiveProof(t *testing.T) {
+	handler := NewAPIKeyHandler[struct{}](nil, nil)
+	for _, request := range []struct {
+		method string          // submitted HTTP request method
+		path   string          // registered secret-bearing route path
+		serve  gin.HandlerFunc // actual Key operation handler
+	}{
+		{http.MethodGet, "/keys", handler.List},
+		{http.MethodGet, "/keys/1", handler.GetByID},
+		{http.MethodPost, "/keys", handler.Create},
+		{http.MethodPut, "/keys/1", handler.Update},
+		{http.MethodPost, "/keys/1/rotate", handler.RotateCredential},
+		{http.MethodDelete, "/keys/1", handler.Delete},
+	} {
+		t.Run(request.method+request.path, func(t *testing.T) {
+			for _, installProof := range []bool{false, true} {
+				router := gin.New()
+				router.Use(func(c *gin.Context) {
+					authctx.SetPrincipal(c, identity.Principal{UserID: 1, CredentialKind: "central"}, 1, "fixture@example.invalid")
+					if installProof {
+						authctx.SetCentralAccess(c, func(class identity.CentralAccessClass) error {
+							if class == identity.CentralAccessOrdinary {
+								return nil
+							}
+							return identity.ErrCentralProofRequired
+						})
+					}
+				})
+				router.Handle(request.method, request.path, request.serve)
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, httptest.NewRequest(request.method, request.path, strings.NewReader("{}")))
+				require.Equal(t, http.StatusForbidden, recorder.Code)
+				require.Contains(t, recorder.Body.String(), "CENTRAL_PROOF_REQUIRED")
+				require.Empty(t, recorder.Header().Values("Set-Cookie"))
+			}
+		})
+	}
+}
+
+// TestCentralTeamOptionsRequireOrganizationalProof submits the normalized team
+// selector to each payer option route. Ordinary continuity must reject the
+// query before any current team owner, subscription or group is read.
+func TestCentralTeamOptionsRequireOrganizationalProof(t *testing.T) {
+	handler := NewAPIKeyHandler[struct{}](nil, nil)
+	for _, request := range []struct {
+		path  string          // registered payer option route
+		serve gin.HandlerFunc // actual payer option handler
+	}{
+		{"/groups/available", handler.GetAvailableGroups},
+		{"/groups/rates", handler.GetUserGroupRates},
+		{"/keys/billing-options", handler.GetBillingOptions},
+	} {
+		t.Run(request.path, func(t *testing.T) {
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				authctx.SetPrincipal(c, identity.Principal{UserID: 1, CredentialKind: "central"}, 1, "fixture@example.invalid")
+				authctx.SetCentralAccess(c, func(class identity.CentralAccessClass) error {
+					if class == identity.CentralAccessOrdinary {
+						return nil
+					}
+					return identity.ErrCentralProofRequired
+				})
+			})
+			router.GET(request.path, request.serve)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, request.path+"?scope=%20TEAM%20", nil))
+			require.Equal(t, http.StatusForbidden, recorder.Code)
+			require.Contains(t, recorder.Body.String(), "CENTRAL_PROOF_REQUIRED")
+			require.Empty(t, recorder.Header().Values("Set-Cookie"))
+		})
+	}
+}
+
+// TestCentralPersonalGroupOptionsRemainAvailable supplies only ordinary proof
+// to the real personal group query. Public groups remain visible, while the
+// callback confirms that this path never requests organizational assurance.
+func TestCentralPersonalGroupOptionsRemainAvailable(t *testing.T) {
+	service := apikey.NewAPIKeyService(nil, availableGroupsUsers{}, availableGroupsRepository{}, nil, nil, nil, nil)
+	handler := NewAPIKeyHandler(service, func(group *routing.Group, _ *accessview.GroupCapacitySummary) *int64 {
+		return &group.ID
+	})
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		authctx.SetPrincipal(c, identity.Principal{UserID: 1, CredentialKind: "central"}, 1, "fixture@example.invalid")
+		authctx.SetCentralAccess(c, func(class identity.CentralAccessClass) error {
+			require.Equal(t, identity.CentralAccessOrdinary, class)
+			return nil
+		})
+	})
+	router.GET("/groups/available", handler.GetAvailableGroups)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/groups/available?scope=personal&include_models=false", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"code":0,"message":"success","data":[1]}`, recorder.Body.String())
 }
