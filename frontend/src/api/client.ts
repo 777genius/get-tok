@@ -1,4 +1,4 @@
-import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig, AxiosResponse } from 'axios'
+import axios, { AxiosInstance, AxiosError, AxiosResponse } from 'axios'
 import type { ApiResponse } from '@/api/common.types'
 import { getLocale } from '@/i18n'
 import { responseErrorMessage, localizedErrorMessage } from '@/i18n/errors'
@@ -11,6 +11,15 @@ import {
 import { refreshAuthTokens } from './tokenRefresh'
 import { getAPIBaseURL } from './url'
 import { isPluginApiPath } from './pluginPaths'
+import {
+  authenticationEpoch,
+  authenticationHeaders,
+  assertAuthenticationEpoch,
+  centralTransport,
+  invalidateCentralTransport,
+  isCentralAuthenticationPath,
+  type AuthenticationRequest,
+} from './authenticationContext'
 
 /**
  * client.ts configures the browser HTTP client and the interceptors that attach
@@ -23,7 +32,10 @@ import { isPluginApiPath } from './pluginPaths'
  * interceptor before its result is delivered. A first host authentication failure
  * can refresh and retry with rotated credentials; failed refresh cleanup checks the
  * captured refresh token and serialized user so an earlier request cannot erase
- * a later session. Authentication-entry failures remain available to their
+ * a later session. Central cookie sessions attach a memory-only CSRF proof and
+ * never enter legacy token refresh. Every dispatched result retains its session
+ * generation, so replacement also fences successful earlier responses.
+ * Authentication-entry failures remain available to their
  * forms. Marked plugin replies keep their own error semantics and do not change
  * native session or feature state.
  */
@@ -65,12 +77,24 @@ const getUserTimezone = (): string => {
  * the credentials and language currently selected.
  */
 apiClient.interceptors.request.use(
-  (config: InternalAxiosRequestConfig) => {
-    // Attach token from localStorage
-    const token = localStorage.getItem('auth_token')
-    if (token && config.headers) {
-      config.headers.Authorization = `Bearer ${token}`
+  (config: AuthenticationRequest) => {
+    // Replayed requests retain their original owner while waiting in Axios's
+    // interceptor queue. Reject a replaced owner before current headers are captured.
+    if (config._authenticationEpoch !== undefined) {
+      assertAuthenticationEpoch(config._authenticationEpoch)
     }
+    const central = centralTransport()
+    config._authenticationEpoch = authenticationEpoch()
+    config._centralAuthentication = central !== null || isCentralAuthenticationPath(config.url)
+    // Central requests never borrow a stored legacy credential. Explicit migration
+    // start alone carries that credential as proof of the existing product owner.
+    if (config._centralAuthentication && !config.allowLegacyIdentityBinding) {
+      config.headers.delete('Authorization')
+    }
+    Object.assign(
+      config.headers,
+      authenticationHeaders(config._centralAuthentication && !config.allowLegacyIdentityBinding),
+    )
 
     // Attach locale for backend translations
     if (config.headers) {
@@ -106,6 +130,10 @@ apiClient.interceptors.request.use(
 
 apiClient.interceptors.response.use(
   (response: AxiosResponse) => {
+    const dispatched = response.config as AuthenticationRequest
+    if (dispatched._authenticationEpoch !== undefined) {
+      assertAuthenticationEpoch(dispatched._authenticationEpoch)
+    }
     /**
      * When a GET finishes after the locale changes, replay it through the request
      * interceptor so the caller receives the current language.
@@ -145,14 +173,20 @@ apiClient.interceptors.response.use(
     return response
   },
   async (error: AxiosError<ApiResponse<unknown>>) => {
+    // A request can lose its owner before reaching the adapter. Preserve that
+    // local rejection so callers discard stale work without reporting a network outage.
+    if (error.code === 'AUTH_SESSION_CHANGED') return Promise.reject(error)
     // Request cancellation: keep the original axios cancellation error so callers can ignore it.
     // Otherwise we'd misclassify it as a generic "network error".
     if (error.code === 'ERR_CANCELED' || axios.isCancel(error)) {
       return Promise.reject(error)
     }
 
-    const originalRequest = error.config as InternalAxiosRequestConfig & {
+    const originalRequest = error.config as AuthenticationRequest & {
       _retry?: boolean // Refresh retry marker.
+    }
+    if (originalRequest?._authenticationEpoch !== undefined) {
+      assertAuthenticationEpoch(originalRequest._authenticationEpoch)
     }
 
     // Handle common errors
@@ -166,6 +200,23 @@ apiClient.interceptors.response.use(
       // plugin-owned errors must not rotate host credentials or change native feature flags.
       const pluginResponse =
         isPluginApiPath(url) && error.response.headers?.['x-tokenrouter-plugin-response'] === '1'
+
+      // A central unauthorized response expires only its captured cookie session.
+      // Entry-point errors remain on their form, and no central response falls
+      // through to legacy bearer refresh or legacy credential cleanup below.
+      if (!pluginResponse && status === 401 && originalRequest?._centralAuthentication) {
+        const entry = isCentralAuthenticationPath(url)
+        if (
+          (!entry || url === '/auth/central/session') &&
+          originalRequest._authenticationEpoch !== undefined &&
+          invalidateCentralTransport(originalRequest._authenticationEpoch)
+        ) {
+          sessionStorage.setItem('auth_expired', '1')
+          if (!entry && !window.location.pathname.includes('/login')) {
+            window.location.href = '/login'
+          }
+        }
+      }
 
       // Ops monitoring disabled: treat as feature-flagged 404, and proactively redirect away
       // from ops pages to avoid broken UI states.
@@ -199,7 +250,12 @@ apiClient.interceptors.response.use(
 
       // Native 401 responses may refresh the current host session once.
       // This handles TOKEN_EXPIRED, INVALID_TOKEN, TOKEN_REVOKED, etc.
-      if (!pluginResponse && status === 401 && !originalRequest._retry) {
+      if (
+        !pluginResponse &&
+        status === 401 &&
+        !originalRequest?._centralAuthentication &&
+        !originalRequest._retry
+      ) {
         const refreshToken = localStorage.getItem('refresh_token')
         const isAuthEndpoint =
           url.includes('/auth/login') ||
@@ -210,6 +266,7 @@ apiClient.interceptors.response.use(
         // If we have a refresh token and this is not an auth endpoint, try to refresh
         if (refreshToken && !isAuthEndpoint) {
           const refreshSessionUser = localStorage.getItem('auth_user')
+          const refreshEpoch = originalRequest._authenticationEpoch ?? authenticationEpoch()
           /**
            * Mark this request before awaiting refresh so a second unauthorized
            * result cannot enter another refresh loop for the same request.
@@ -225,6 +282,10 @@ apiClient.interceptors.response.use(
                 : null
             const tokens = await refreshAuthTokens({ failedAccessToken })
 
+            // A successful refresh may settle after logout or another login. Check
+            // the original owner before retry dispatch can capture the newer session.
+            assertAuthenticationEpoch(refreshEpoch)
+
             /**
              * Retry through the shared client with the rotated access token so
              * authentication headers reflect the completed refresh attempt.
@@ -234,6 +295,9 @@ apiClient.interceptors.response.use(
             }
             return apiClient(originalRequest)
           } catch {
+            // Generation changes take precedence over token comparisons, including
+            // a replacement login for the same user with otherwise matching storage.
+            assertAuthenticationEpoch(refreshEpoch)
             /**
              * A failed refresh for an earlier identity must not clear a later login; compare
              * refresh token and serialized user before cleanup.

@@ -116,6 +116,11 @@ import AppLayout from '@/components/layout/AppLayout.vue'
 import Icon from '@/components/icons/Icon.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
 import { buildApiUrl } from '@/api/client'
+import {
+  authenticationHeaders,
+  authenticationEpoch,
+  assertAuthenticationEpoch,
+} from '@/api/authenticationContext'
 import { COPY_FEEDBACK_MS } from '@/constants/ui'
 import { buildEmbeddedUrl, detectTheme } from '@/utils/embedded-url'
 import { useMediaQuery } from '@vueuse/core'
@@ -286,6 +291,7 @@ let markdownGeneration = 0
 // Requests are not aborted by a replacement call or component unmount.
 async function fetchAndRenderMarkdown(slug: string) {
   const generation = ++markdownGeneration
+  const expectedSession = authenticationEpoch()
   loading.value = true
   tocItems.value = []
   activeHeadingId.value = ''
@@ -293,15 +299,18 @@ async function fetchAndRenderMarkdown(slug: string) {
     const resp = await fetch(buildApiUrl(`/pages/${encodeURIComponent(slug)}`), {
       headers: {
         'Accept-Language': locale.value,
-        ...(authStore.token ? { Authorization: `Bearer ${authStore.token}` } : {}),
+        ...authenticationHeaders(),
       },
+      credentials: 'include',
     })
     if (generation !== markdownGeneration) return
+    assertAuthenticationEpoch(expectedSession)
     if (!resp.ok) {
       renderedHtml.value = `<p class="text-red-500">${t('customPage.markdownNotFound')}</p>`
       return
     }
     let raw = await resp.text()
+    assertAuthenticationEpoch(expectedSession)
     if (generation !== markdownGeneration) return
     const contentLanguage = resp.headers.get('Content-Language') || ''
 

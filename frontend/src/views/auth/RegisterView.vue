@@ -297,6 +297,12 @@
           }}
         </button>
       </form>
+      <CentralSignInSection
+        v-if="registrationEnabled && settingsLoaded"
+        intent="register"
+        :disabled="registrationActionDisabled"
+        @start="handleCentralStart"
+      />
 
       <div
         v-if="
@@ -374,6 +380,8 @@ import { AuthLayout } from '@/components/layout'
 import EmailOAuthButtons from '@/components/auth/EmailOAuthButtons.vue'
 import LinuxDoOAuthSection from '@/components/auth/LinuxDoOAuthSection.vue'
 import OidcOAuthSection from '@/components/auth/OidcOAuthSection.vue'
+import CentralSignInSection from '@/components/auth/CentralSignInSection.vue'
+import { centralAuthAPI, type CentralLoginSelection } from '@/api/centralAuth'
 import WechatOAuthSection from '@/components/auth/WechatOAuthSection.vue'
 import LoginAgreementPrompt from '@/components/auth/LoginAgreementPrompt.vue'
 import Icon from '@/components/icons/Icon.vue'
@@ -1061,32 +1069,39 @@ async function acquireActionProof(): Promise<boolean> {
 }
 
 // handleOAuthStart applies consent and loading gates before provider navigation.
-// Without action captcha it opens the built start URL directly; otherwise it
-// obtains proof, calls the start endpoint, and consumes proof after the request
-// settles.
-async function handleOAuthStart(request: OAuthLoginStart): Promise<void> {
+// Legacy entries without action captcha retain direct navigation. Central entries
+// always record explicit intent with the backend first. Captcha proof is consumed
+// after either start request settles, and both paths share the same consent gate.
+async function handleOAuthStart(request: OAuthLoginStart | CentralLoginSelection): Promise<void> {
   if (registrationActionDisabled.value || !ensureAgreementAccepted()) return
 
-  if (!actionCaptchaEnabled.value) {
+  if (!actionCaptchaEnabled.value && request.provider !== 'central') {
     window.location.href = buildOAuthLoginStartURL(request)
     return
   }
 
   isLoading.value = true
   try {
-    const proof = await turnstileRef.value?.verifyAction()
-    if (!proof) return
+    const proof = actionCaptchaEnabled.value ? await turnstileRef.value?.verifyAction() : undefined
+    if (actionCaptchaEnabled.value && !proof) return
 
-    const result = await startOAuthLogin(
-      request,
-      tencentCaptchaEnabled.value
-        ? {
-            tencent_captcha_ticket: proof.token,
-            tencent_captcha_randstr: proof.randstr,
-          }
-        : { turnstile_token: proof.token },
-    )
-    window.location.href = result.authorize_url
+    const captcha = !proof
+      ? {}
+      : tencentCaptchaEnabled.value
+        ? { tencent_captcha_ticket: proof.token, tencent_captcha_randstr: proof.randstr }
+        : { turnstile_token: proof.token }
+    if (request.provider === 'central') {
+      const result = await centralAuthAPI.start({
+        intent: 'register',
+        provider: request.identityProvider,
+        ...captcha,
+        invitation_code: formData.invitation_code.trim() || undefined,
+      })
+      window.location.href = result.authorization_url
+    } else {
+      const result = await startOAuthLogin(request, captcha)
+      window.location.href = result.authorize_url
+    }
   } catch (error: unknown) {
     errorMessage.value = extractI18nErrorMessage(error, t, 'auth.errors', t('auth.turnstileFailed'))
     appStore.showError(errorMessage.value)
@@ -1094,6 +1109,13 @@ async function handleOAuthStart(request: OAuthLoginStart): Promise<void> {
     resetCaptchaProof()
     isLoading.value = false
   }
+}
+
+// handleCentralStart routes the advertised provider through the existing consent gate.
+// The parent retains captcha and registration policy ownership; no provider button can
+// navigate independently or turn ordinary login into implicit account creation.
+async function handleCentralStart(provider: string | undefined): Promise<void> {
+  await handleOAuthStart({ provider: 'central', identityProvider: provider })
 }
 
 // ensureAgreementAccepted allows authentication only when the current consent gate

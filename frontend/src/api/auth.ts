@@ -1,4 +1,5 @@
 import { apiClient } from './client'
+import { authenticationEpoch, assertAuthenticationEpoch } from './authenticationContext'
 import { buildApiUrl } from './url'
 import { refreshAuthTokens, type RefreshTokenResponse } from './tokenRefresh'
 export type { RefreshTokenResponse } from './tokenRefresh'
@@ -199,9 +200,13 @@ export function clearAuthToken(): void {
  * that order. These writes are sequential and storage failures propagate after
  * any preceding write, so callers cannot treat publication as one atomic storage
  * operation.
+ * The request generation is checked again immediately before publication, so
+ * a session adopted during response handling prevents every storage write.
  */
 export async function login(credentials: LoginRequest): Promise<LoginResponse> {
+  const expected = authenticationEpoch()
   const { data } = await apiClient.post<LoginResponse>('/auth/login', credentials)
+  assertAuthenticationEpoch(expected)
 
   // A challenge response is not a completed login; publish credentials and user data only after the response passes the TOTP discriminator.
   if (!isTotp2FARequired(data)) {
@@ -226,9 +231,13 @@ export async function login(credentials: LoginRequest): Promise<LoginResponse> {
  * entries untouched. Storage exceptions propagate after any preceding write, so
  * this sequence provides ordered publication rather than rollback of a partially
  * written session.
+ * A replacement session during response handling rejects the old completion
+ * before its credentials reach persistent browser storage.
  */
 export async function login2FA(request: TotpLogin2FARequest): Promise<AuthResponse> {
+  const expected = authenticationEpoch()
   const { data } = await apiClient.post<AuthResponse>('/auth/login/2fa', request)
+  assertAuthenticationEpoch(expected)
 
   // Publish the access token and available companion values before the user snapshot so subsequent browser reads can observe the completed authentication data.
   setAuthToken(data.access_token)
@@ -251,9 +260,13 @@ export async function login2FA(request: TotpLogin2FARequest): Promise<AuthRespon
  * storage exception interrupts the sequence after any earlier writes. Consumers
  * therefore receive a completed response only after these storage operations
  * finish successfully.
+ * The captured generation must still own the browser at publication; otherwise
+ * the response rejects without restoring credentials from the earlier request.
  */
 export async function register(userData: RegisterRequest): Promise<AuthResponse> {
+  const expected = authenticationEpoch()
   const { data } = await apiClient.post<AuthResponse>('/auth/register', userData)
+  assertAuthenticationEpoch(expected)
 
   // Publish the access token and available companion values before the user snapshot so subsequent browser reads can observe the completed authentication data.
   setAuthToken(data.access_token)
@@ -280,9 +293,11 @@ export async function getCurrentUser() {
 /**
  * logout attempts to revoke the stored refresh token before clearing local
  * authentication values. Revocation errors are ignored so local logout can still
- * complete; localStorage access errors continue to propagate.
+ * complete; localStorage access errors continue to propagate. A session adopted
+ * during revocation owns its credentials and is preserved by the generation check.
  */
 export async function logout(): Promise<void> {
+  const expected = authenticationEpoch()
   const refreshToken = getRefreshToken()
 
   // Try to revoke the refresh token on the server
@@ -294,7 +309,7 @@ export async function logout(): Promise<void> {
     }
   }
 
-  clearAuthToken()
+  if (authenticationEpoch() === expected) clearAuthToken()
 }
 
 /**

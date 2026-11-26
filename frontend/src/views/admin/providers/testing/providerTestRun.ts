@@ -1,5 +1,10 @@
 import { reactive } from 'vue'
 import { buildApiUrl } from '@/api/client'
+import {
+  authenticationHeaders,
+  authenticationEpoch,
+  assertAuthenticationEpoch,
+} from '@/api/authenticationContext'
 import { ADMIN_UI_REQUEST_HEADER } from '@/api/adminUIRequest'
 import type {
   SystemOneTestPayload,
@@ -312,17 +317,20 @@ export async function executeProviderTest(options: {
         Object.values(decision.questions).some((question) => question.type === 'box'))
     // Choosing images or Box in this administrator form explicitly opts this test into the
     // experimental upstream feature. Private image names and associations never leave the browser.
+    const expectedSession = authenticationEpoch()
     const response = await fetch(buildApiUrl(`/admin/providers/${options.providerId}/test`), {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${localStorage.getItem('auth_token')}`,
+        ...authenticationHeaders(),
         'Content-Type': 'application/json',
         [ADMIN_UI_REQUEST_HEADER]: '1',
         ...(usesImages ? { 'TypeSafe-Danger-Zone-Images': 'true' } : {}),
       },
       body: JSON.stringify(requestBody),
       signal: options.signal,
+      credentials: 'include',
     })
+    assertAuthenticationEpoch(expectedSession)
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`)
     }
@@ -335,6 +343,7 @@ export async function executeProviderTest(options: {
     let buffer = ''
     while (true) {
       const { done, value } = await reader.read()
+      assertAuthenticationEpoch(expectedSession)
       if (done) break
 
       // Retain decoder state and the unfinished line between reads so split UTF-8 bytes and

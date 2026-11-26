@@ -60,6 +60,18 @@ API 记录按所属领域维护在 `api/*.types.ts` 或 `api/admin/*.types.ts`�
 
 ## 启动与验证约束
 
+<a id="central_browser_session"></a>
+
+### 共享身份与浏览器会话
+
+共享身份的中央账户绑定和资源范围见[身份与租户](../domains/identity_and_tenancy.md#shared_identity_sessions)。浏览器通过同源 BFF 使用 HttpOnly cookie；中央 profile、CSRF 和绝对到期时间只保存在当前文档内存。`api/authenticationContext.ts` 是 API 与 store 共用的传输边界，API 不反向依赖 store 或 router。每次保护资源请求，包括 GET，都附带当前文档的 CSRF，防止另一标签页替换共享 cookie 后把不同账户的数据交给旧页面。
+
+首次导航等待 `/auth/central/session` 恢复；中央 callback 自己处理恢复，先移除固定错误参数，再读取 cookie session。该页面拒绝 code、token、state、fragment 和自定义 redirect。登录及注册按钮使用服务器声明的 provider，并沿用父表单已有的协议和 captcha 条件；无绑定的 login 不能自动变为注册或邮箱合并。
+
+会话替换增加文档内的 generation。请求派发、响应发布、刷新后的 retry 以及 legacy API 的存储写入都核对原 generation；队列中的旧请求不能借用新会话重新执行。中央认证不调用 legacy refresh，profile 轮询也不延长原 deadline。中央 logout 等待服务端确认撤销，失败时保留当前页面以便重试；403 的额外证明要求不会被当成退出。部署及原生浏览器验证入口见[共享身份部署](../operations/shared_identity_deployment.md)。
+
+### 应用启动
+
 应用先设置主题和 viewport，再安装 Pinia 并读取注入配置。语言初始化及公开设置的语言匹配完成后安装路由和 i18n，等待初次路由就绪后挂载。CLI 导入会话的 fragment 在创建浏览器 history 前清理，导航进度在鉴权守卫前安装。
 
 路由记录分为公开、用户和管理员三组，匹配顺序保持该顺序，catch-all 最后。守卫测试调用实际安装的守卫，验证身份、功能开关、首次设置和重定向，而不是复制另一份判断逻辑。

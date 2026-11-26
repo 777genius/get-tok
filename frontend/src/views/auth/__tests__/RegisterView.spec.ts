@@ -138,6 +138,7 @@ async function mountView() {
         LinuxDoOAuthSection: true,
         WechatOAuthSection: true,
         OidcOAuthSection: true,
+        CentralSignInSection: true,
         TurnstileWidget: true,
         Icon: true,
         RouterLink: { template: '<a><slot /></a>' },

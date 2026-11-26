@@ -78,7 +78,7 @@ describe('application authentication guard', () => {
   // storage. Permission checks observe that restored state, and later
   // navigations do not restore it again.
   it('restores authentication once before checking access', async () => {
-    authStore.checkAuth.mockImplementation(() => {
+    authStore.initializeSession.mockImplementation(() => {
       authStore.isAuthenticated = true
       authStore.isAdmin = true
     })
@@ -88,7 +88,7 @@ describe('application authentication guard', () => {
     const second = runGuard('/dashboard')
     await second.navigation
     expect(second.next).toHaveBeenCalledExactlyOnceWith()
-    expect(authStore.checkAuth).toHaveBeenCalledTimes(1)
+    expect(authStore.initializeSession).toHaveBeenCalledTimes(1)
   })
 
   // An unauthenticated protected-page visit still assigns its document title.

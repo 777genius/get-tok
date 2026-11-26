@@ -17,7 +17,7 @@ const routerHarness = vi.hoisted(() => ({
 // the production guard; every test begins with an unauthenticated browser
 // session.
 const authStore = vi.hoisted(() => ({
-  checkAuth: vi.fn(), // Browser session restoration spy.
+  initializeSession: vi.fn(), // Awaitable browser session restoration spy.
   isAuthenticated: false, // Current authenticated session status.
   isAdmin: false, // Current administrator role status.
   hasPendingAuthSession: false, // Incomplete external authentication status.
@@ -79,7 +79,7 @@ export async function resetRouterHarness(): Promise<void> {
   vi.resetModules()
   routerHarness.router = null
   routerHarness.guard = null
-  authStore.checkAuth.mockReset()
+  authStore.initializeSession.mockReset()
   authStore.isAuthenticated = false
   authStore.isAdmin = false
   authStore.hasPendingAuthSession = false

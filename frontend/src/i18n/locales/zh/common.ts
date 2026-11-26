@@ -171,6 +171,25 @@ export default {
   },
   // Auth
   auth: {
+    central: {
+      logoutFailed: '无法确认退出登录，请重试。',
+      signIn: '使用 {provider} 登录',
+      register: '使用 {provider} 创建账户',
+      defaultProvider: '统一账户',
+      callbackTitle: '正在完成登录',
+      completing: '正在验证您的账户和会话…',
+      unavailable: '统一账户登录暂时不可用。',
+      retry: '重试',
+      returnToLogin: '返回登录',
+      errors: {
+        account_not_linked:
+          '此身份尚未关联 GetTok 账户。您可以创建新账户，或使用原来的方式登录。系统不会自动关联已有账户。',
+        account_conflict: '关联已有账户前需要验证所有权。请使用原来的方式登录，以继续访问该账户。',
+        temporarily_unavailable: '登录暂时不可用，请稍后重试。',
+        access_denied: '登录已取消或访问被拒绝。',
+        authentication_failed: '无法完成登录，请重新发起登录。',
+      },
+    },
     welcomeBack: '欢迎回来',
     signInToAccount: '登录您的账户以继续',
     signIn: '登录',

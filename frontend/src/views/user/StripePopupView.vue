@@ -66,6 +66,11 @@ import { useRoute } from 'vue-router'
 import { extractI18nErrorMessage } from '@/utils/apiError'
 import { isMobileDevice } from '@/utils/device'
 import { buildApiUrl } from '@/api/client'
+import {
+  authenticationHeaders,
+  authenticationEpoch,
+  assertAuthenticationEpoch,
+} from '@/api/authenticationContext'
 
 /**
  * StripePopupView.vue initializes a wallet checkout after a same-origin opener supplies
@@ -278,18 +283,19 @@ async function pollOrderStatus() {
   if (pollInFlight) return
   pollInFlight = true
   try {
-    // The popup reads auth_token when polling because its direct order fetch needs the same
-    // authenticated context as the opener.
-    const token = localStorage.getItem('auth_token') || ''
+    // Capture the session before reading an order so a late poll cannot publish
+    // payment state after this tab adopts another account or completes logout.
+    const expectedSession = authenticationEpoch()
     const res = await fetch(buildApiUrl(`/payment/orders/${orderId}`), {
       headers: {
         'Accept-Language': getLocale(),
-        ...(token ? { Authorization: 'Bearer ' + token } : {}),
+        ...authenticationHeaders(),
       },
       credentials: 'include',
     })
     if (!res.ok) return
     const data = await res.json()
+    assertAuthenticationEpoch(expectedSession)
     const status = data?.data?.status
     if (status === 'PROCESSING') {
       hint.value = t('payment.result.processing')

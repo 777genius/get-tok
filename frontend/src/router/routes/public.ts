@@ -135,6 +135,16 @@ export const publicRoutes: RouteRecordRaw[] = [
     },
   },
   {
+    path: '/auth/central/callback',
+    name: 'CentralAuthCallback',
+    component: () => import('@/views/auth/CentralCallbackView.vue'),
+    meta: {
+      requiresAuth: false,
+      title: 'Sign-In Callback',
+      titleKey: 'auth.central.callbackTitle',
+    },
+  },
+  {
     path: '/auth/oidc/callback',
     name: 'OIDCOAuthCallback',
     component: () => import('@/views/auth/OidcCallbackView.vue'),

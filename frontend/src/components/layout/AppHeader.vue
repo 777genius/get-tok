@@ -457,16 +457,18 @@ function closeDropdown() {
 
 // handleLogout closes the menu, attempts logout, and navigates to login.
 //
-// A logout rejection is logged and still followed by navigation; navigation failures
-// propagate to the event caller.
+// Central logout must finish server revocation before navigation reports completion.
+// A rejected revocation keeps the current page available and offers a visible retry.
 async function handleLogout() {
   closeDropdown()
   try {
     await authStore.logout()
   } catch (error) {
-    // Continue to login after logging a logout failure so a rejected logout request does
-    // not strand the account menu flow.
+    // A failed central revocation leaves its cookie live, so keep the current view
+    // and report the failure instead of implying that the user has signed out.
     console.error('Logout error:', error)
+    appStore.showError(t('auth.central.logoutFailed'))
+    return
   }
   await router.push('/login')
 }

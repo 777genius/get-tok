@@ -51,6 +51,7 @@ export function installRouteGuards(router: Router): void {
     '/auth/dingtalk/callback',
     '/auth/dingtalk/email-completion',
     '/auth/oidc/callback',
+    '/auth/central/callback',
     '/auth/wechat/callback',
     '/auth/wechat/payment/callback',
   ]
@@ -87,7 +88,18 @@ export function installRouteGuards(router: Router): void {
     // Restore browser authentication before title and permission evaluation, then retain
     // the initialization marker for later navigations on this router.
     if (!authInitialized) {
-      authStore.checkAuth()
+      // The central callback adopts its cookie itself, avoiding a competing bootstrap
+      // request that could publish an earlier browser identity during completion.
+      if (to.path !== '/auth/central/callback') {
+        try {
+          await authStore.initializeSession()
+        } catch {
+          if (to.meta.requiresAuth !== false) {
+            next({ path: '/login', query: { error: 'temporarily_unavailable' } })
+            return
+          }
+        }
+      }
       authInitialized = true
     }
     const appStore = useAppStore()
