@@ -309,15 +309,9 @@ func (h *CentralHandler) Wrap(legacy gin.HandlerFunc, administrator bool) gin.Ha
 		// An explicit legacy credential can follow a completed central logout.
 		// Only a durable inert-cookie observation permits that selection; unknown,
 		// live or unavailable session state cannot silently downgrade authentication.
-		if h.Flow != nil && c.GetHeader("Authorization") != "" {
-			raw, readErr := h.readCookie(c, false)
-			if readErr == nil {
-				saved, stateErr := h.Flow.Store.ReadSession(c.Request.Context(), identity.CentralSecretDigest(raw))
-				if stateErr == nil && (saved.RevokedAt != nil || !time.Now().Before(saved.ExpiresAt)) {
-					legacy(c)
-					return
-				}
-			}
+		if h.allowsLegacyCookieFallback(c) {
+			legacy(c)
+			return
 		}
 		centralNoStore(c)
 		if !h.enabled(c) || !h.browserOrigin(c, !centralSafeMethod(c.Request.Method)) {
@@ -374,6 +368,26 @@ func (h *CentralHandler) HasCookie(c *gin.Context) bool {
 		}
 	}
 	return false
+}
+
+// allowsLegacyCookieFallback permits explicit legacy credentials beside a
+// retained cookie only after storage confirms that session is revoked or
+// expired. Middleware and public logout share this selection rule, so a
+// completed central logout cannot redirect subsequent legacy withdrawal into
+// the wrong handler. Missing cookies, unknown rows, read failures and live
+// sessions never establish this fallback. The selected legacy handler retains
+// its own credential and current-account checks; this decision grants no
+// authentication or product authority.
+func (h *CentralHandler) allowsLegacyCookieFallback(c *gin.Context) bool {
+	if h.Flow == nil || c.GetHeader("Authorization") == "" {
+		return false
+	}
+	raw, err := h.readCookie(c, false)
+	if err != nil {
+		return false
+	}
+	session, err := h.Flow.Store.ReadSession(c.Request.Context(), identity.CentralSecretDigest(raw))
+	return err == nil && (session.RevokedAt != nil || !time.Now().Before(session.ExpiresAt))
 }
 
 // authenticate rejects mixed Bearer and cookie identities before resolving a

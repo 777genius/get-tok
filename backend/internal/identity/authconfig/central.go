@@ -66,7 +66,7 @@ func (c CentralIdentityConfig) Validate() error {
 		if c.TestLoopback && !loopback {
 			return fmt.Errorf("central_identity.test_loopback only admits loopback endpoints")
 		}
-		if u.Scheme != "https" && !(c.TestLoopback && u.Scheme == "http" && loopback) {
+		if u.Scheme != "https" && (!c.TestLoopback || u.Scheme != "http" || !loopback) {
 			return fmt.Errorf("central_identity.%s requires HTTPS outside the TEST loopback profile", name)
 		}
 		if name == "origin" && u.Path != "" {
@@ -85,7 +85,7 @@ func (c CentralIdentityConfig) Validate() error {
 			return fmt.Errorf("central_identity.providers contains an invalid or repeated alias")
 		}
 		for _, letter := range alias {
-			if !(letter >= 'a' && letter <= 'z' || letter >= '0' && letter <= '9' || letter == '-' || letter == '_') {
+			if (letter < 'a' || letter > 'z') && (letter < '0' || letter > '9') && letter != '-' && letter != '_' {
 				return fmt.Errorf("central_identity.providers contains an invalid alias")
 			}
 		}

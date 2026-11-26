@@ -2,6 +2,9 @@ package httpapi
 
 import (
 	"github.com/gin-gonic/gin"
+
+	"github.com/TokenFlux/TokenRouter/internal/identity"
+	"github.com/TokenFlux/TokenRouter/internal/identity/httpapi/authctx"
 )
 
 // authentication.go dispatches authentication requests to assembled session
@@ -9,7 +12,9 @@ import (
 // Authentication routes share one assembled set of session, pending, and
 // provider handlers. Dispatch passes the request to the selected child
 // instance, so validation, cookie changes, and response writing stay with the
-// handler that implements that login or continuation flow.
+// handler that implements that login or continuation flow. Session withdrawal
+// selects the authenticated principal or the durable cookie-fallback rule;
+// an inert cookie retained after logout cannot replace a later legacy owner.
 
 // AuthenticationHandler retains the assembled login handlers used by identity
 // route dispatch.
@@ -190,10 +195,12 @@ func (h *AuthenticationHandler) Login(c *gin.Context) { h.Session.Login(c) }
 // challenge and completes its account or pending binding.
 func (h *AuthenticationHandler) Login2FA(c *gin.Context) { h.Session.Login2FA(c) }
 
-// Logout delegates to the child handler that attempts refresh-token revocation
-// and invokes the configured browser pending logout callback.
+// Logout selects central cookie withdrawal unless the same durable fallback
+// rule as authentication admits an explicit legacy credential. Legacy logout
+// keeps its existing optional refresh payload and pending-browser cleanup;
+// this dispatch does not add an access-token validation requirement.
 func (h *AuthenticationHandler) Logout(c *gin.Context) {
-	if h.Central != nil && h.Central.HasCookie(c) {
+	if h.Central != nil && h.Central.HasCookie(c) && !h.Central.allowsLegacyCookieFallback(c) {
 		h.Central.Logout(c)
 		return
 	}
@@ -227,10 +234,16 @@ func (h *AuthenticationHandler) Register(c *gin.Context) { h.Session.Register(c)
 // email reset credential and replacement password through authentication.
 func (h *AuthenticationHandler) ResetPassword(c *gin.Context) { h.Session.ResetPassword(c) }
 
-// RevokeAllSessions delegates to the child handler that requests
-// refresh-session revocation for the currently authenticated account.
+// RevokeAllSessions selects withdrawal from the principal already established
+// by authentication middleware. A retained cookie cannot redirect a current
+// legacy owner into another account's central handler, and a central principal
+// without its assembled handler fails closed.
 func (h *AuthenticationHandler) RevokeAllSessions(c *gin.Context) {
-	if h.Central != nil && h.Central.HasCookie(c) {
+	if authctx.IsCentral(c) {
+		if h.Central == nil {
+			centralHTTPError(c, identity.ErrCentralUnavailable)
+			return
+		}
 		h.Central.RevokeAll(c)
 		return
 	}

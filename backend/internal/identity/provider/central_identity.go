@@ -233,8 +233,7 @@ func centralRPCError(err error) error {
 	if connect.CodeOf(err) == connect.CodeUnavailable || connect.CodeOf(err) == connect.CodeDeadlineExceeded || connect.CodeOf(err) == connect.CodeResourceExhausted || connect.CodeOf(err) == connect.CodeInternal {
 		return identity.ErrCentralUnavailable
 	}
-	var failure *connect.Error
-	if errors.As(err, &failure) {
+	if failure, ok := errors.AsType[*connect.Error](err); ok {
 		for _, detail := range failure.Details() {
 			decoded, decodeErr := detail.Value()
 			if decodeErr != nil {

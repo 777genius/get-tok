@@ -26,12 +26,14 @@ import (
 // HttpOnly, host-only scope, Secure production transport and rejection of
 // cross-site or same-site sibling origins before application state changes.
 
-// centralHTTPStoreProbe returns one already committed owner for middleware scenarios.
+// centralHTTPStoreProbe supplies committed session facts and records withdrawal ownership.
 type centralHTTPStoreProbe struct {
 	identity.CentralSessionStore                                // unused writes fail if a read-only guard invokes them
 	session                      identity.CentralSession        // immutable session issued to the replacement tab
 	status                       identity.CentralStatusEvidence // fresh authority observation
 	user                         *identity.User                 // current active owner for the opaque cookie
+	readErr                      error                          // explicit failure to observe the original session
+	revokedUsers                 []int64                        // local owners selected for account-wide withdrawal
 }
 
 // centralHTTPAuthorityProbe supplies only the fresh read used by this middleware test.
@@ -40,14 +42,24 @@ type centralHTTPAuthorityProbe struct {
 	status                            identity.CentralStatusEvidence // fresh observation of the replacement owner
 }
 
-// ReadSession returns the original persisted session before authority observation.
+// ReadSession returns the fixture's persisted session and configured read
+// error. Tests distinguish a durably inert cookie from an unknown or unavailable
+// session that cannot admit legacy fallback.
 func (p *centralHTTPStoreProbe) ReadSession(context.Context, string) (identity.CentralSession, error) {
-	return p.session, nil
+	return p.session, p.readErr
 }
 
 // PublishAndRead supplies the unchanged committed facts after a successful fresh read.
 func (p *centralHTTPStoreProbe) PublishAndRead(context.Context, string, identity.CentralStatusEvidence) (identity.CentralSession, identity.CentralStatusEvidence, *identity.User, error) {
 	return p.session, p.status, p.user, nil
+}
+
+// RevokeUserSessions records the local owner selected by central withdrawal.
+// The probe grants no other write capability, so a test can distinguish this
+// operation from legacy refresh-token revocation.
+func (p *centralHTTPStoreProbe) RevokeUserSessions(_ context.Context, userID int64, _ time.Time) error {
+	p.revokedUsers = append(p.revokedUsers, userID)
+	return nil
 }
 
 // GetAccountStatus returns the independently authenticated observation for the fixture.
