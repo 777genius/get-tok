@@ -57,8 +57,14 @@ type OidcIDTokenClaims struct {
 	Nonce string `json:"nonce,omitempty"`
 	// Azp names the authorized party. Multiple audiences require a nonempty value
 	// matching the configured ClientID; a single audience does not trigger this check.
-	Azp                  string `json:"azp,omitempty"`
-	jwt.RegisteredClaims        // standard issuer, subject, audience, and time claims
+	Azp string `json:"azp,omitempty"`
+	// AuthTime records the actual authentication flow separately from token
+	// issuance. Omitted values remain absent for the consumer's admission policy.
+	AuthTime              *jwt.NumericDate `json:"auth_time,omitempty"`
+	SessionID             string           `json:"sid,omitempty"` // signed upstream session identifier
+	AuthenticationContext string           `json:"acr,omitempty"` // signed authentication context observation
+	AuthenticationMethods []string         `json:"amr,omitempty"` // signed authentication method observations
+	jwt.RegisteredClaims                   // standard issuer, subject, audience, and time claims
 }
 
 // OidcUserInfoClaims aliases identity profile suggestions returned from optional OIDC userinfo.
@@ -360,8 +366,8 @@ func GetGJSONBool(body string, path string) (bool, bool) {
 // After JWT validation, it requires a nonempty subject, compares a supplied nonce,
 // and requires azp to match ClientID when the token has multiple audiences.
 //
-// JWT defaults validate expiry and not-before when present; these options do not
-// require an expiry claim or enable issued-at checking. Key selection returns the
+// Expiry and issuance are required and future issuance is checked with the
+// configured clock leeway. Key selection returns the
 // first decodable metadata match, while the JWT signing method checks key-type
 // compatibility afterward. The returned claims keep provider text for the HTTP
 // flow to reconcile with userinfo and select the issuer/subject identity.
@@ -398,12 +404,17 @@ func OidcParseAndValidateIDToken(ctx context.Context, cfg OIDCOptions, idToken s
 		jwt.WithAudience(cfg.ClientID),
 		jwt.WithIssuer(cfg.IssuerURL),
 		jwt.WithLeeway(leeway),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
 	)
 	if err != nil {
 		return nil, err
 	}
 	if !parsed.Valid {
 		return nil, errors.New("id_token invalid")
+	}
+	if claims.IssuedAt == nil || !claims.ExpiresAt.After(claims.IssuedAt.Time) {
+		return nil, errors.New("id_token invalid time bounds")
 	}
 	if strings.TrimSpace(claims.Subject) == "" {
 		return nil, errors.New("id_token missing sub")
@@ -639,12 +650,23 @@ func (OIDCClient) FetchUserInfo(ctx context.Context, c OIDCOptions, t *OidcToken
 
 // ValidateIDToken verifies the credential and returns the subset consumed by
 // identity HTTP flows. It retains issuer, subject, profile suggestions, and the
-// optional email-verification pointer from the validated claims for userinfo
-// reconciliation and account decisions.
+// optional email-verification pointer and signed authentication observations.
+// Authentication time is never synthesized from token issuance for consumers.
 func (OIDCClient) ValidateIDToken(ctx context.Context, c OIDCOptions, token, nonce string) (*identity.OIDCVerifiedClaims, error) {
 	v, e := OidcParseAndValidateIDToken(ctx, c, token, nonce)
-	if v == nil {
+	if e != nil {
 		return nil, e
 	}
-	return &identity.OIDCVerifiedClaims{Issuer: v.Issuer, Subject: v.Subject, Email: v.Email, PreferredUsername: v.PreferredUsername, Name: v.Name, EmailVerified: v.EmailVerified}, e
+	result := &identity.OIDCVerifiedClaims{
+		Issuer: v.Issuer, Subject: v.Subject, Email: v.Email, PreferredUsername: v.PreferredUsername,
+		Name: v.Name, EmailVerified: v.EmailVerified,
+		IssuedAt: v.IssuedAt.UTC(), ExpiresAt: v.ExpiresAt.UTC(),
+		SessionID: v.SessionID, AuthenticationContext: v.AuthenticationContext,
+		AuthenticationMethods: append([]string(nil), v.AuthenticationMethods...),
+	}
+	if v.AuthTime != nil {
+		observed := v.AuthTime.UTC()
+		result.AuthenticatedAt = &observed
+	}
+	return result, nil
 }
