@@ -24,7 +24,10 @@ import type {
 // profile/CSRF state; legacy authentication requires both a token and user,
 // while pending external authentication remains a separate persisted session. Login
 // responses and callback tokens follow different publication sequences because callbacks
-// can already have stored refresh credentials.
+// can already have stored refresh credentials. Bootstrap probes the central cookie
+// before restoring legacy storage; only 401, 404, or an explicitly disabled response
+// permits that fallback. Explicit central callbacks clear volatile authority before
+// reading the cookie, while unverified callbacks leave persisted legacy credentials intact.
 //
 // Locale synchronization tracks the last user identifier so background profile polling
 // does not replace a language selected during the session. Timers are stopped before
@@ -172,10 +175,11 @@ export const useAuthStore = defineStore('auth', () => {
   const hasPendingAuthSession = computed(() => pendingAuthSession.value !== null)
 
   // checkAuth restores token, user, refresh credentials, and pending authentication from
-  // browser storage. Call it during initial navigation before evaluating route
-  // permissions. A restored user starts a background profile read and periodic refresh;
-  // a stored expiry of zero still schedules token renewal. Synchronous restoration
-  // failures clear authentication while retaining a valid pending external session.
+  // browser storage. Call it only for the initializer's legacy fallback after the BFF
+  // returns 401, 404, or CENTRAL_DISABLED. A restored user starts a background profile
+  // read and periodic refresh; a stored expiry of zero still schedules token renewal.
+  // Synchronous restoration failures clear authentication while retaining a valid pending
+  // external session.
   // Profile request failures are logged asynchronously and do not block initial route
   // matching.
   function checkAuth(): void {
@@ -573,13 +577,25 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  // restoreCentralSession adopts only a server-confirmed cookie session with a live deadline.
-  // Call it after the fixed central callback or during initial navigation without legacy
-  // credentials. The captured generation rejects completion after logout or another login.
-  // Adoption removes legacy credentials before publishing the central profile, and its
-  // expiry timer clears local authority without attempting token renewal. Background
-  // profile polling cannot move that deadline or turn status evidence into authentication.
+  // restoreCentralSession starts the callback's explicit transition to cookie authority.
+  // Clearing volatile publication first fences old requests and stops legacy timers before
+  // the session read captures its generation. Persisted credentials remain available if
+  // this unverified callback fails, so visiting its URL cannot permanently log out a
+  // legacy user. Ordinary navigation probes the cookie through the private helper instead,
+  // without treating an anonymous or disabled central endpoint as a new login attempt.
   async function restoreCentralSession(): Promise<User> {
+    resetSessionState()
+    return readCentralSession()
+  }
+
+  // readCentralSession adopts only a server-confirmed cookie session with a live deadline.
+  // The callback wrapper and ordinary bootstrap share this validation and publication
+  // boundary. Its captured generation rejects completion after logout or another login.
+  // Successful adoption removes legacy credentials before publishing the central profile,
+  // and its expiry timer clears local authority without attempting token renewal.
+  // Background profile polling cannot move that deadline or turn status evidence into
+  // authentication, while failed reads never discard persisted legacy credentials.
+  async function readCentralSession(): Promise<User> {
     const expected = authenticationEpoch()
     const response: CentralSession = await centralAuthAPI.session()
     assertAuthenticationEpoch(expected)
@@ -611,20 +627,25 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   // initializeSession joins initial restoration before navigation evaluates protected routes.
-  // Existing legacy credentials retain their established synchronous restore path. Otherwise
-  // the backend decides whether an HttpOnly central cookie represents a current session.
-  // Anonymous or disabled endpoints are normal; service failures remain observable errors.
+  // An adopted central session needs no additional read. Otherwise volatile legacy
+  // authority stops before the local BFF resolves the cookie, including after callback
+  // failures and reloads. Only 401, 404, or an explicitly disabled response permits the
+  // legacy restore path; outages remain errors. A superseded attempt cannot fall back
+  // through checkAuth and replace a newer callback's authentication generation.
   async function initializeSession(): Promise<void> {
     if (initialization) return initialization
     const attempt = (async () => {
-      checkAuth()
-      if (isAuthenticated.value) return
+      if (authMode.value === 'central' && isAuthenticated.value) return
+      if (authMode.value === 'legacy') resetSessionState()
+      const expected = authenticationEpoch()
       try {
-        await restoreCentralSession()
+        await readCentralSession()
       } catch (error) {
+        assertAuthenticationEpoch(expected)
         const { status, code } = error as { status?: number; code?: string }
         const disabled = status === 503 && code === 'CENTRAL_DISABLED'
         if (status !== 401 && status !== 404 && !disabled) throw error
+        checkAuth()
       }
     })()
     initialization = attempt
@@ -643,6 +664,27 @@ export const useAuthStore = defineStore('auth', () => {
   })
   onScopeDispose(stopCentralExpiration)
 
+  // resetSessionState releases the store's volatile authentication ownership without
+  // deleting browser storage. Timers stop before the generation advances, so delayed
+  // profile and renewal work cannot publish into a callback's new attempt. Dropping the
+  // initialization slot also prevents later navigation from joining a superseded flight;
+  // its existing callers still observe their own fenced promise. Logout and verified
+  // adoption reuse this reset before performing their separate persisted cleanup.
+  function resetSessionState(): void {
+    stopAutoRefresh()
+    stopTokenRefresh()
+    replaceAuthentication()
+    initialization = null
+    centralEpoch = null
+    authMode.value = null
+    token.value = null
+    refreshTokenValue.value = null
+    tokenExpiresAt.value = null
+    localeUserID = null
+    user.value = null
+    pendingAuthSession.value = null
+  }
+
   // clearAuth stops profile and renewal timers before removing reactive and persisted
   // credentials. The optional preservePendingAuthSession flag reloads valid pending
   // external authentication after access-session storage has been cleared. Without that
@@ -655,19 +697,7 @@ export const useAuthStore = defineStore('auth', () => {
     // clearing access credentials; omission clears that pending context as well.
     preservePendingAuthSession?: boolean
   }): void {
-    // Release owned refresh timers before clearing credentials so future timer ticks
-    // cannot start new profile or token work for the cleared session.
-    stopAutoRefresh()
-    stopTokenRefresh()
-
-    replaceAuthentication()
-    centralEpoch = null
-    authMode.value = null
-    token.value = null
-    refreshTokenValue.value = null
-    tokenExpiresAt.value = null
-    localeUserID = null
-    user.value = null
+    resetSessionState()
     localStorage.removeItem(AUTH_TOKEN_KEY)
     localStorage.removeItem(AUTH_USER_KEY)
     localStorage.removeItem(REFRESH_TOKEN_KEY)

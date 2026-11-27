@@ -369,8 +369,8 @@ import { useAppStore, useAuthStore } from '@/stores'
 // Child panels own protocol selection and expanded quote controls.
 //
 // Compact summaries distinguish token context intervals, image resolutions, and
-// named video prices using the server's group-scaled quote. Initialization restores
-// theme and account state, awaits missing public settings, then loads the catalog.
+// named video prices using the server's group-scaled quote. The route guard owns account
+// restoration; this page restores theme, awaits missing settings, then loads the catalog.
 // Locale and account changes request another catalog load. Request generations
 // and captured account identity reject stale responses, including errors and
 // loading completion. Account changes clear the previous catalog synchronously,
@@ -999,11 +999,11 @@ onBeforeUnmount(() => {
   requestGeneration++
 })
 
-// Restore theme and account state before loading missing public settings, then
-// request model groups so branding is available for the initial public presentation.
+// Restore theme before loading missing public settings and requesting model groups.
+// Use the route guard's account state so a failed central-session read cannot be
+// replaced by synchronous legacy restoration while this public page mounts.
 onMounted(async () => {
   initTheme()
-  authStore.checkAuth()
   if (!appStore.publicSettingsLoaded) {
     await appStore.fetchPublicSettings()
   }

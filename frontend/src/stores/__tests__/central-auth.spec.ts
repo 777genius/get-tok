@@ -13,9 +13,10 @@ import { centralTransport, replaceAuthentication } from '@/api/authenticationCon
 // The same store also owns legacy callback adoption, whose generation can change
 // while its refresh-token storage stays intact. A delayed HTTP response exercises
 // the real refresh coordinator at that boundary and must not overwrite the
-// callback's credential. Bootstrap fixtures distinguish a deliberately disabled
-// central capability from an enabled but unavailable service; only the former
-// completes anonymous navigation through the existing route guard.
+// callback's credential. Bootstrap fixtures give the server cookie priority over
+// old legacy storage while retaining the allowed unauthenticated, not-found, and disabled fallbacks.
+// Explicit callbacks reset volatile authority without deleting unverified credentials;
+// retries, reloads, and superseded bootstrap failures exercise that boundary directly.
 
 // Endpoint spies control only external effects; the actual store owns timers, browser
 // storage, generation checks, and user publication throughout these scenarios.
@@ -101,25 +102,178 @@ describe('central browser session ownership', () => {
     expect(store.isAuthenticated).toBe(false)
   })
 
-  // Callback restoration can fail transiently while the server cookie remains usable.
-  // A later navigation bootstrap retries that actual store operation and retains its recovered session.
-  it('recovers a failed callback restoration on the next navigation bootstrap', async () => {
+  // A callback outage must not revive stored or already-reactive legacy authority.
+  // Retained credentials survive the unverified read, including reload, until a successful cookie adoption.
+  it.each(['stored', 'reactive', 'reload'])(
+    'recovers the central cookie before legacy credentials for %s state',
+    async (state) => {
+      if (state === 'reactive') {
+        endpoints.login.mockResolvedValue({
+          access_token: 'legacy-access',
+          refresh_token: 'legacy-refresh',
+          expires_in: 3600,
+          user,
+        })
+        await store.login({ email: user.email, password: 'test-only' })
+      } else {
+        localStorage.setItem('auth_token', 'legacy-access')
+        localStorage.setItem('refresh_token', 'legacy-refresh')
+        localStorage.setItem('auth_user', JSON.stringify(user))
+        localStorage.setItem('token_expires_at', '9999999999999')
+      }
+      const keys = ['auth_token', 'refresh_token', 'auth_user', 'token_expires_at']
+      const retained = keys.map((key) => localStorage.getItem(key))
+      endpoints.session.mockRejectedValueOnce({ status: 503, code: 'CENTRAL_UNAVAILABLE' })
+      const callback = store.restoreCentralSession()
+      expect(store.isAuthenticated).toBe(false)
+      expect(store.authMode).toBeNull()
+      expect(store.user).toBeNull()
+      expect(vi.getTimerCount()).toBe(0)
+      await expect(callback).rejects.toMatchObject({ status: 503, code: 'CENTRAL_UNAVAILABLE' })
+      expect(keys.map((key) => localStorage.getItem(key))).toEqual(retained)
+
+      if (state === 'reload') {
+        store.$dispose()
+        replaceAuthentication()
+        setActivePinia(createPinia())
+        store = useAuthStore()
+      }
+      endpoints.session.mockRejectedValueOnce({ status: 503, code: 'CENTRAL_UNAVAILABLE' })
+      await expect(store.initializeSession()).rejects.toMatchObject({
+        status: 503,
+        code: 'CENTRAL_UNAVAILABLE',
+      })
+      expect(store.isAuthenticated).toBe(false)
+      expect(endpoints.profile).not.toHaveBeenCalled()
+      expect(endpoints.refresh).not.toHaveBeenCalled()
+      expect(keys.map((key) => localStorage.getItem(key))).toEqual(retained)
+
+      await store.initializeSession()
+      expect(store.isAuthenticated).toBe(true)
+      expect(store.authMode).toBe('central')
+      expect(store.user?.id).toBe(user.id)
+      expect(keys.map((key) => localStorage.getItem(key))).toEqual(keys.map(() => null))
+      expect(endpoints.session).toHaveBeenCalledTimes(3)
+      await store.initializeSession()
+      expect(endpoints.session).toHaveBeenCalledTimes(3)
+    },
+  )
+
+  // A legacy login can finish after a public bootstrap outage left navigation initialization pending.
+  // A later central outage must suspend that reactive authority without deleting its recoverable credentials.
+  it('suspends reactive legacy authority while a subsequent bootstrap is unavailable', async () => {
+    endpoints.login.mockResolvedValue({
+      access_token: 'legacy-access',
+      refresh_token: 'legacy-refresh',
+      expires_in: 3600,
+      user,
+    })
+    await store.login({ email: user.email, password: 'test-only' })
+    expect(store.isAuthenticated).toBe(true)
+    const keys = ['auth_token', 'refresh_token', 'auth_user', 'token_expires_at']
+    const retained = keys.map((key) => localStorage.getItem(key))
     endpoints.session.mockRejectedValueOnce({ status: 503, code: 'CENTRAL_UNAVAILABLE' })
-    await expect(store.restoreCentralSession()).rejects.toMatchObject({
+
+    const initialization = store.initializeSession()
+    expect(store.isAuthenticated).toBe(false)
+    expect(store.user).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+    await expect(initialization).rejects.toMatchObject({
       status: 503,
       code: 'CENTRAL_UNAVAILABLE',
     })
-    expect(store.isAuthenticated).toBe(false)
+    expect(keys.map((key) => localStorage.getItem(key))).toEqual(retained)
+    expect(endpoints.profile).not.toHaveBeenCalled()
 
+    endpoints.session.mockRejectedValueOnce({
+      status: 401,
+      code: 'CENTRAL_AUTHENTICATION_REQUIRED',
+    })
+    endpoints.profile.mockResolvedValue({ data: user })
     await store.initializeSession()
     expect(store.isAuthenticated).toBe(true)
-    expect(store.authMode).toBe('central')
+    expect(store.authMode).toBe('legacy')
     expect(store.user?.id).toBe(user.id)
-    expect(endpoints.session).toHaveBeenCalledTimes(2)
-
-    await store.initializeSession()
+    expect(keys.map((key) => localStorage.getItem(key))).toEqual(retained)
     expect(endpoints.session).toHaveBeenCalledTimes(2)
   })
+
+  // A navigable callback URL cannot permanently remove a valid legacy session without proof.
+  // Ordinary bootstrap restores retained credentials only after 401, 404, or an explicitly disabled response.
+  it.each([
+    { status: 401, code: 'CENTRAL_AUTHENTICATION_REQUIRED' },
+    { status: 404, code: 'NOT_FOUND' },
+    { status: 503, code: 'CENTRAL_DISABLED' },
+  ])('retains legacy fallback after an unverified callback returns $code', async (failure) => {
+    localStorage.setItem('auth_token', 'legacy-access')
+    localStorage.setItem('refresh_token', 'legacy-refresh')
+    localStorage.setItem('auth_user', JSON.stringify(user))
+    localStorage.setItem('token_expires_at', '9999999999999')
+    store.setPendingAuthSession({
+      token: 'pending-proof',
+      token_field: 'pending_auth_token',
+      provider: 'oidc',
+    })
+    const keys = [
+      'auth_token',
+      'refresh_token',
+      'auth_user',
+      'token_expires_at',
+      'pending_auth_session',
+    ]
+    const retained = keys.map((key) => localStorage.getItem(key))
+    endpoints.session.mockRejectedValue(failure)
+    endpoints.profile.mockResolvedValue({ data: user })
+
+    await expect(store.restoreCentralSession()).rejects.toMatchObject(failure)
+    expect(store.isAuthenticated).toBe(false)
+    expect(keys.map((key) => localStorage.getItem(key))).toEqual(retained)
+    await store.initializeSession()
+    expect(store.isAuthenticated).toBe(true)
+    expect(store.authMode).toBe('legacy')
+    expect(store.token).toBe('legacy-access')
+    expect(store.hasPendingAuthSession).toBe(true)
+    expect(endpoints.session).toHaveBeenCalledTimes(2)
+    expect(keys.map((key) => localStorage.getItem(key))).toEqual(retained)
+  })
+
+  // An older bootstrap can settle on either side of a newer callback's confirmed adoption.
+  // Its failure must neither restore legacy storage nor retain ownership of the initialization flight.
+  it.each(['old-first', 'new-first'])(
+    'fences a superseded bootstrap when completion order is %s',
+    async (order) => {
+      localStorage.setItem('auth_token', 'legacy-access')
+      localStorage.setItem('auth_user', JSON.stringify(user))
+      const obsoleteResponse = Promise.withResolvers<ReturnType<typeof sessionResponse>>()
+      const currentResponse = Promise.withResolvers<ReturnType<typeof sessionResponse>>()
+      endpoints.session
+        .mockReturnValueOnce(obsoleteResponse.promise)
+        .mockReturnValueOnce(currentResponse.promise)
+      const obsolete = store.initializeSession()
+      const rejected = expect(obsolete).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' })
+      const current = store.restoreCentralSession()
+
+      if (order === 'old-first') {
+        obsoleteResponse.reject({ status: 401, code: 'CENTRAL_AUTHENTICATION_REQUIRED' })
+        await rejected
+        expect(store.isAuthenticated).toBe(false)
+        expect(endpoints.profile).not.toHaveBeenCalled()
+        currentResponse.resolve(sessionResponse())
+        await current
+      } else {
+        currentResponse.resolve(sessionResponse())
+        await current
+        const initialized = store.initializeSession()
+        obsoleteResponse.reject({ status: 401, code: 'CENTRAL_AUTHENTICATION_REQUIRED' })
+        await expect(initialized).resolves.toBeUndefined()
+        await rejected
+      }
+      expect(store.authMode).toBe('central')
+      expect(store.user?.id).toBe(user.id)
+      expect(endpoints.profile).not.toHaveBeenCalled()
+      expect(localStorage.getItem('auth_token')).toBeNull()
+    },
+  )
 
   // Legacy callback adoption advances ownership before loading its profile while retaining refresh storage.
   // An earlier refresh must not publish through that real production transition.
@@ -188,18 +342,25 @@ describe('central browser session ownership', () => {
     expect(endpoints.refresh).not.toHaveBeenCalled()
   })
 
-  // An earlier legacy profile request completes after the central callback publishes.
-  // Its user and failure cannot overwrite or clear the new cookie-owned identity.
-  it('rejects late legacy profile publication after central adoption', async () => {
+  // An earlier legacy profile request completes while the explicit callback is still pending.
+  // Starting that transition fences its publication before the new cookie has been confirmed.
+  it('rejects late legacy profile publication as the central callback starts', async () => {
     endpoints.login.mockResolvedValue({ access_token: 'legacy-token', user })
     await store.login({ email: user.email, password: 'test-only' })
     const pending = Promise.withResolvers<{ data: typeof user }>()
     endpoints.profile.mockReturnValue(pending.promise)
     const obsolete = store.refreshUser()
     const rejected = expect(obsolete).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' })
-    await store.restoreCentralSession()
+    const central = Promise.withResolvers<ReturnType<typeof sessionResponse>>()
+    endpoints.session.mockReturnValueOnce(central.promise)
+    const adopted = store.restoreCentralSession()
     pending.resolve({ data: { ...user, id: 99 } })
     await rejected
+    expect(store.isAuthenticated).toBe(false)
+    expect(store.user).toBeNull()
+    expect(localStorage.getItem('auth_token')).toBe('legacy-token')
+    central.resolve(sessionResponse())
+    await adopted
     expect(store.authMode).toBe('central')
     expect(store.user?.id).toBe(7)
     expect(localStorage.getItem('auth_user')).toBeNull()
