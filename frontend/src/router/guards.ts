@@ -89,8 +89,8 @@ export function installRouteGuards(router: Router): void {
     // Retain only successful restoration so a public-page visit during an outage cannot
     // prevent a valid browser cookie from being restored on later protected navigation.
     if (!authInitialized) {
-      // The central callback adopts its cookie itself, avoiding a competing bootstrap
-      // request that could publish an earlier browser identity during completion.
+      // The central callback adopts its cookie itself without completing this marker.
+      // Later navigation retries a failed callback, while the store retains a successful one.
       if (to.path !== '/auth/central/callback') {
         try {
           await authStore.initializeSession()
@@ -101,8 +101,6 @@ export function installRouteGuards(router: Router): void {
             return
           }
         }
-      } else {
-        authInitialized = true
       }
     }
     const appStore = useAppStore()

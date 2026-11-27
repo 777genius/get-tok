@@ -150,9 +150,10 @@ func TestCentralBindingWithRetainedCookie(t *testing.T) {
 			engine.POST("/api/v1/auth/central/start", handler.Start)
 			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18182/api/v1/auth/central/start", strings.NewReader(`{"intent":"bind"}`))
 			request.Header.Set("Origin", handler.Options.Origin)
-			if row.credential == "valid" {
+			switch row.credential {
+			case "valid":
 				request.Header.Set("Authorization", "Bearer "+fixture.token)
-			} else if row.credential == "invalid" {
+			case "invalid":
 				request.Header.Set("Authorization", "Bearer invalid-credential")
 			}
 			if row.cookie != "" {

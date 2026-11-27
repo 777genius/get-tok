@@ -101,6 +101,26 @@ describe('central browser session ownership', () => {
     expect(store.isAuthenticated).toBe(false)
   })
 
+  // Callback restoration can fail transiently while the server cookie remains usable.
+  // A later navigation bootstrap retries that actual store operation and retains its recovered session.
+  it('recovers a failed callback restoration on the next navigation bootstrap', async () => {
+    endpoints.session.mockRejectedValueOnce({ status: 503, code: 'CENTRAL_UNAVAILABLE' })
+    await expect(store.restoreCentralSession()).rejects.toMatchObject({
+      status: 503,
+      code: 'CENTRAL_UNAVAILABLE',
+    })
+    expect(store.isAuthenticated).toBe(false)
+
+    await store.initializeSession()
+    expect(store.isAuthenticated).toBe(true)
+    expect(store.authMode).toBe('central')
+    expect(store.user?.id).toBe(user.id)
+    expect(endpoints.session).toHaveBeenCalledTimes(2)
+
+    await store.initializeSession()
+    expect(endpoints.session).toHaveBeenCalledTimes(2)
+  })
+
   // Legacy callback adoption advances ownership before loading its profile while retaining refresh storage.
   // An earlier refresh must not publish through that real production transition.
   it('rejects legacy refresh publication after setToken changes session ownership', async () => {
@@ -150,6 +170,8 @@ describe('central browser session ownership', () => {
     localStorage.setItem('token_expires_at', '9999999999999')
     await store.restoreCentralSession()
     const original = centralTransport()
+    await store.initializeSession()
+    expect(endpoints.session).toHaveBeenCalledTimes(1)
     expect(store.isAuthenticated).toBe(true)
     expect(store.authMode).toBe('central')
     expect(store.token).toBeNull()

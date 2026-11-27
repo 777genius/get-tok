@@ -113,18 +113,30 @@ describe('application authentication guard', () => {
     expect(authStore.initializeSession).toHaveBeenCalledTimes(2)
   })
 
-  // The central callback owns session restoration before navigating to the dashboard.
-  // The guard must not introduce a competing bootstrap during or after that callback.
-  it('delegates central callback restoration without another bootstrap', async () => {
-    const callback = runGuard('/auth/central/callback')
-    await callback.navigation
-    expect(callback.next).toHaveBeenCalledExactlyOnceWith()
-    authStore.isAuthenticated = true
-    const dashboard = runGuard('/dashboard')
-    await dashboard.navigation
-    expect(dashboard.next).toHaveBeenCalledExactlyOnceWith()
-    expect(authStore.initializeSession).not.toHaveBeenCalled()
-  })
+  // The callback owns its first restoration, which can either adopt the cookie or fail.
+  // Later protected navigation initializes once, retaining success or retrying the failed attempt.
+  it.each([false, true])(
+    'delegates the callback and initializes later navigation for failure=%s',
+    async (failed) => {
+      const callback = runGuard('/auth/central/callback')
+      await callback.navigation
+      expect(callback.next).toHaveBeenCalledExactlyOnceWith()
+      expect(authStore.initializeSession).not.toHaveBeenCalled()
+
+      authStore.isAuthenticated = !failed
+      authStore.initializeSession.mockImplementationOnce(() => {
+        authStore.isAuthenticated = true
+      })
+      const dashboard = runGuard('/dashboard')
+      await dashboard.navigation
+      expect(dashboard.next).toHaveBeenCalledExactlyOnceWith()
+
+      const later = runGuard('/dashboard')
+      await later.navigation
+      expect(later.next).toHaveBeenCalledExactlyOnceWith()
+      expect(authStore.initializeSession).toHaveBeenCalledTimes(1)
+    },
+  )
 
   // An unauthenticated protected-page visit still assigns its document title.
   // The resolved route title and current site name reach the browser before
