@@ -1,3 +1,6 @@
+# Dockerfile builds the frontend and Go backend for source-based deployments.
+# Builder versions follow the repository toolchain pins so dependency security
+# fixes reach the compiled backend and browser assets shipped together in one image.
 # =============================================================================
 # TokenRouter Multi-Stage Dockerfile
 # =============================================================================
@@ -7,7 +10,7 @@
 # =============================================================================
 
 ARG NODE_IMAGE=node:26.12.1-alpine
-ARG GOLANG_IMAGE=golang:1.27.3-alpine
+ARG GOLANG_IMAGE=golang:1.27.4-alpine
 ARG ALPINE_IMAGE=alpine:3.20
 ARG GOPROXY=https://goproxy.cn,direct
 ARG GOSUMDB=sum.golang.google.cn

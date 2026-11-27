@@ -184,7 +184,8 @@ func initializeApplication(ctx context.Context, cfg *config.Config, info BuildIn
 	defaultLoadBalancer := providePaymentLoadBalancer(instanceStore, encryptionKey)
 	configService := providePaymentConfigCore(instanceStore, store, encryptionKey, plans)
 	runtime := providePaymentRuntime(client, registry, defaultLoadBalancer, redeemService, subscriptionService, affiliateService, notificationEmailService, instanceStore, groupStore, userStore, configService, encryptionKey, oAuthSettings, tasks, calendar)
-	appIdentityHTTP := provideIdentityHTTP(appIdentityAuthGraph, userService, cfg, appIdentityAuthSettings, backendMode, publicService, promoService, redeemService, totpService, userAttributeService, tasks, runtime)
+	centralHandler := provideCentralIdentity(cfg, db, appIdentityAuthGraph, userService, appIdentityAuthSettings, backendMode, totpService, secretEncryptor)
+	appIdentityHTTP := provideIdentityHTTP(appIdentityAuthGraph, userService, cfg, appIdentityAuthSettings, backendMode, publicService, promoService, redeemService, totpService, userAttributeService, tasks, runtime, centralHandler)
 	appAuthRouteMount := provideAuthRouteMount(marketplaceHandler, publicHandler, handler, passkeyHandler, appIdentityHTTP)
 	userHandler := providePromotionUserHTTP(affiliateService)
 	subscriptionHandler := httpapi.NewSubscriptionHandler(subscriptionService)
@@ -561,13 +562,13 @@ func initializeApplication(ctx context.Context, cfg *config.Config, info BuildIn
 	idempotencyCoordinator := provideIdempotencyCoordinator(idempotencyRepository, cfg)
 	idempotencyCleanupService := provideIdempotencyCleanupService(idempotencyRepository, cfg)
 	appHttpRouteMount := provideHTTPRouteMount(appAuthRouteMount, appUserRouteMount, appAdminRouteMount, appGatewayRouteMount, appPaymentRouteMount, appPluginRouteMount, idempotencyCoordinator, idempotencyCleanupService)
-	jwtAuthMiddleware := provideJWTAuth(appIdentityAuthGraph, userService, runtimeSettings, auditLogService)
+	jwtAuthMiddleware := provideJWTAuth(appIdentityAuthGraph, userService, runtimeSettings, auditLogService, centralHandler)
 	mcpoAuthServer, err := provideMCPOAuth(db, userService, cfg, store, manager)
 	if err != nil {
 		return nil, err
 	}
 	mcpTokenService := provideMCPTokens(db, userService, secretEncryptor, cfg, mcpoAuthServer)
-	adminAuthMiddleware := provideAdminAuth(appIdentityAuthGraph, userService, runtimeSettings, auditLogService, mcpTokenService)
+	adminAuthMiddleware := provideAdminAuth(appIdentityAuthGraph, userService, runtimeSettings, auditLogService, mcpTokenService, centralHandler)
 	v := provideAuditMiddleware(auditLogService, redactor)
 	stepUpAuthMiddleware := provideStepUpAuth(totpService, userService, runtimeSettings)
 	handler4, err := provideMCPHTTP(mcpoAuthServer, mcpTokenService, redisClient, secretEncryptor, totpService, userService, runtimeSettings, store, cfg)

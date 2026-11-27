@@ -182,6 +182,7 @@ func provideIdentityHTTP(
 	attributes *identity.UserAttributeService,
 	tasks *lifecycle.Tasks,
 	payments *payment.Runtime,
+	central *identityhttp.CentralHandler,
 ) *identityHTTP {
 	runtime := identityHTTPSettings{identityAuthSettings: settings, BackendMode: backend, public: public}
 	flow := &identity.PendingFlow{Store: identitypostgres.NewPendingRepository(g.Client, time.Now), Database: &identitypostgres.PendingFlowDatabase{Client: g.Client, Auth: g.Core, Profiles: users}, Auth: g.Core, Profiles: users}
@@ -208,6 +209,7 @@ func provideIdentityHTTP(
 	pending = identityhttp.NewPendingHandler(session, flow, identityhttp.PendingHTTPOptions{ForceEmailOnSignup: runtime.ForceEmail, AfterLogin: func(ctx context.Context, p *identity.PendingAuthSession, id int64) { syncer.Pending(ctx, p, id, false) }, AfterRegistration: func(ctx context.Context, p *identity.PendingAuthSession, id int64) { syncer.Pending(ctx, p, id, true) }})
 	wechat := identityhttp.NewWeChatHandler(pending, bind, identityadapter.WeChatClient{TokenURL: identityadapter.DefaultWeChatTokenURL, UserInfoURL: identityadapter.DefaultWeChatUserInfoURL}, identityhttp.WeChatHTTPOptions{LoadConfig: runtime.WeChat, FrontendCallback: runtime.WeChatFrontend})
 	auth := &identityhttp.AuthenticationHandler{
+		Central: central,
 		Session: session, Pending: pending, Bind: bind,
 		LinuxDo: identityhttp.NewLinuxDoHandler(pending, bind, identityadapter.LinuxDoClient{}, runtime.LinuxDo),
 		OIDC:    identityhttp.NewOIDCHandler(pending, bind, identityadapter.OIDCClient{}, runtime.OIDC),

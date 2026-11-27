@@ -1,0 +1,377 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
+	"github.com/stretchr/testify/require"
+
+	dbent "github.com/TokenFlux/TokenRouter/ent"
+	"github.com/TokenFlux/TokenRouter/internal/identity"
+	"github.com/TokenFlux/TokenRouter/internal/testutil/postgrescontainer"
+)
+
+// central_session_integration_test.go verifies browser authentication writes
+// against the application's actual migrated PostgreSQL schema. The fixtures
+// share the SQL pool with Ent so transaction participation, row locks and unique
+// constraints execute through the same adapters used by the application. Each
+// test owns an isolated database and uses a controlled microsecond-precision clock.
+//
+// These scenarios concentrate on ownership and revocation boundaries: a failed
+// session write must roll back registration, concurrent registration must not
+// split one authority account between local owners, a changed local credential
+// must invalidate migration proof, and delayed ACTIVE evidence must not erase a
+// committed denial. Ordinary unit tests cover the remaining pure policy cases.
+
+// centralStoreFixture builds matching real database participants for one test.
+func centralStoreFixture(t *testing.T) (*CentralSessionStore, *sql.DB, time.Time) {
+	t.Helper()
+	db := postgrescontainer.New(t)
+	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	users := NewUserStore(client, db)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	state := NewAuthState(client, &identity.AuthDependencies{Users: users})
+	return NewCentralSessionStore(db, client, state, func() time.Time { return now }), db, now
+}
+
+// centralCompletion creates independently issued evidence for one authority account.
+func centralCompletion(now time.Time, account, email, secret string) identity.CentralLoginCompletion {
+	policy := identity.CentralConsumerPolicy{ConsumerID: "gettok", AuthorityIncarnation: "authority-test", OrdinaryPolicyID: "gettok-ordinary-login", OrdinaryPolicyVersion: 1}
+	status := identity.CentralStatusEvidence{Account: identity.CentralAccountReference{AccountID: account, AuthorityIncarnation: policy.AuthorityIncarnation}, ConsumerID: policy.ConsumerID, Eligibility: identity.CentralEligibilityActive, Revision: 1, SecurityEpoch: 1, AttachmentGeneration: 1, ObservedAt: now, ValidUntil: now.Add(identity.CentralSourceLease)}
+	return identity.CentralLoginCompletion{
+		Intent: identity.CentralLoginIntent{Intent: identity.CentralIntentRegister}, Issuer: "https://identity.test/realms/test", Subject: "subject-" + account,
+		Status: status, Policy: policy, RequestStartedAt: now,
+		NewUser: &identity.User{Email: email, PasswordHash: "unusable-fixture-hash", CentralManaged: true, Role: "user", Status: "active", Balance: 17, Concurrency: 2},
+		Session: identity.CentralSession{Digest: identity.CentralSecretDigest(secret), CSRFSecret: strings.Repeat("c", 64), Account: status.Account, SecurityEpoch: 1, AttachmentGeneration: 1, CreatedAt: now, ExpiresAt: now.Add(4 * time.Minute), Admission: identity.CentralSessionAdmission{AuthoritySessionID: "qualified-session-" + account, Profile: identity.CentralProfileProviderSession, PolicyID: policy.OrdinaryPolicyID, PolicyVersion: 1, AuthenticatedAt: now.Add(-time.Minute), ValidUntil: now.Add(4 * time.Minute)}},
+	}
+}
+
+// TestCentralStoreAtomicOwnership races browser consumption and first account
+// registration against real storage. One owner must survive, while a later
+// session-key conflict rolls back the attempted registration.
+func TestCentralStoreAtomicOwnership(t *testing.T) {
+	store, db, now := centralStoreFixture(t)
+	ctx := t.Context()
+	flow := identity.CentralLoginTransaction{StateDigest: identity.CentralSecretDigest("state"), BrowserDigest: identity.CentralSecretDigest("browser"), Ciphertext: "encrypted-intent", CreatedAt: now, ExpiresAt: now.Add(5 * time.Minute)}
+	require.NoError(t, store.SaveLogin(ctx, flow))
+	_, err := store.ConsumeLogin(ctx, flow.StateDigest, identity.CentralSecretDigest("wrong-browser"), now)
+	require.ErrorIs(t, err, identity.ErrCentralSessionExpired)
+	var consumed sync.WaitGroup
+	results := make(chan error, 2)
+	for range 2 {
+		consumed.Go(func() {
+			_, err := store.ConsumeLogin(ctx, flow.StateDigest, flow.BrowserDigest, now)
+			results <- err
+		})
+	}
+	consumed.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		} else {
+			require.ErrorIs(t, err, identity.ErrCentralSessionExpired)
+		}
+	}
+	require.Equal(t, 1, successes)
+
+	first := centralCompletion(now, "one", "first@example.invalid", "session-one")
+	first.Session.Admission.ValidUntil = first.Session.Admission.ValidUntil.Add(999 * time.Nanosecond)
+	second := centralCompletion(now, "one", "second@example.invalid", "session-two")
+	bound, err := store.HasBinding(ctx, first.Status.Account, first.Issuer, first.Subject)
+	require.NoError(t, err)
+	require.False(t, bound)
+	type result struct {
+		commit identity.CentralLoginCommit // committed local owner and issued session
+		err    error                       // database transaction result
+	}
+	commits := make(chan result, 2)
+	for _, input := range []identity.CentralLoginCompletion{first, second} {
+		consumed.Go(func() {
+			commit, err := store.CompleteLogin(ctx, input)
+			commits <- result{commit, err}
+		})
+	}
+	consumed.Wait()
+	close(commits)
+	var userID int64
+	created := 0
+	for result := range commits {
+		require.NoError(t, result.err)
+		if result.commit.Created {
+			created++
+		}
+		if userID != 0 {
+			require.Equal(t, userID, result.commit.User.ID)
+		}
+		userID = result.commit.User.ID
+		require.Equal(t, float64(17), result.commit.User.Balance)
+		require.True(t, result.commit.User.CentralManaged)
+		persisted, err := store.ReadSession(ctx, result.commit.Session.Digest)
+		require.NoError(t, err)
+		require.Equal(t, result.commit.Session, persisted, "raw admission and local expiry must survive PostgreSQL round trip")
+	}
+	require.Equal(t, 1, created)
+	var count int
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM users").Scan(&count))
+	require.Equal(t, 1, count)
+	bound, err = store.HasBinding(ctx, first.Status.Account, first.Issuer, first.Subject)
+	require.NoError(t, err)
+	require.True(t, bound)
+	_, err = store.HasBinding(ctx, first.Status.Account, first.Issuer, "different-subject")
+	require.ErrorIs(t, err, identity.ErrCentralConflict)
+	_, err = store.HasBinding(ctx, first.Status.Account, "https://other.example.test", first.Subject)
+	require.ErrorIs(t, err, identity.ErrCentralConflict)
+	retry := first
+	retry.NewUser, retry.Artifacts = nil, nil
+	retry.Session.Digest = identity.CentralSecretDigest("registration-retry")
+	retried, err := store.CompleteLogin(ctx, retry)
+	require.NoError(t, err)
+	require.False(t, retried.Created)
+	require.Equal(t, userID, retried.User.ID)
+	require.Equal(t, float64(17), retried.User.Balance)
+	// The duplicate digest fails after a different new user and binding were
+	// written. Their absence proves registration joined the outer transaction.
+	conflict := centralCompletion(now, "other", "rollback@example.invalid", "session-one")
+	_, err = store.CompleteLogin(ctx, conflict)
+	require.ErrorIs(t, err, identity.ErrCentralConflict)
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM users WHERE email='rollback@example.invalid'").Scan(&count))
+	require.Zero(t, count)
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM central_identity_bindings WHERE account_id='other'").Scan(&count))
+	require.Zero(t, count)
+	var originalEmail string
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT email FROM users WHERE id=$1", userID).Scan(&originalEmail))
+	conflict = centralCompletion(now, "email-collision", originalEmail, "email-session")
+	_, err = store.CompleteLogin(ctx, conflict)
+	require.ErrorIs(t, err, identity.ErrCentralConflict)
+	// Removing the binding invalidates the earlier preflight. The commit must
+	// reject missing creation artifacts instead of recreating ownership implicitly.
+	_, err = db.ExecContext(ctx, "DELETE FROM central_identity_sessions WHERE local_user_id=$1", userID)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "DELETE FROM central_identity_bindings WHERE account_id='one'")
+	require.NoError(t, err)
+	retry.Session.Digest = identity.CentralSecretDigest("removed-binding-retry")
+	_, err = store.CompleteLogin(ctx, retry)
+	require.ErrorIs(t, err, identity.ErrCentralEvidenceInvalid)
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM central_identity_sessions WHERE token_hash=$1", retry.Session.Digest).Scan(&count))
+	require.Zero(t, count)
+}
+
+// TestCentralStoreBindingAndRevocation changes legacy credentials around an
+// attempted binding and then withdraws the resulting session. Committed ownership
+// retains balances and machine keys while old authentication and stale status fail.
+func TestCentralStoreBindingAndRevocation(t *testing.T) {
+	store, db, now := centralStoreFixture(t)
+	ctx := t.Context()
+	user := &identity.User{Email: "owner@example.invalid", PasswordHash: "old-hash", Role: "user", Status: "active", Balance: 42, Concurrency: 3}
+	require.NoError(t, store.auth.Users.Create(ctx, user))
+	_, err := db.ExecContext(ctx, "UPDATE users SET totp_enabled=true,totp_secret_encrypted='sealed-factor',totp_enabled_at=$2 WHERE id=$1", user.ID, now.Add(-time.Hour))
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO api_keys(user_id,key,name) VALUES($1,'machine-key-fixture','retained')", user.ID)
+	require.NoError(t, err)
+	owner, err := store.auth.Users.GetByID(ctx, user.ID)
+	require.NoError(t, err)
+	input := centralCompletion(now, "bound", "unused@example.invalid", "bound-session")
+	input.NewUser = nil
+	input.Intent = identity.CentralLoginIntent{Intent: identity.CentralIntentBind, OwnerProof: &identity.CentralOwnerProof{LocalUserID: user.ID, CredentialFingerprint: identity.CentralOwnerFingerprint(owner), VerifiedAt: now}}
+	_, err = db.ExecContext(ctx, "UPDATE users SET password_hash='replacement-hash' WHERE id=$1", user.ID)
+	require.NoError(t, err)
+	_, err = store.CompleteLogin(ctx, input)
+	require.ErrorIs(t, err, identity.ErrCentralProofRequired)
+	owner, err = store.auth.Users.GetByID(ctx, user.ID)
+	require.NoError(t, err)
+	require.False(t, owner.CentralManaged)
+	input.Intent.OwnerProof.CredentialFingerprint = identity.CentralOwnerFingerprint(owner)
+	commit, err := store.CompleteLogin(ctx, input)
+	require.NoError(t, err)
+	require.False(t, commit.Created)
+	require.Equal(t, user.ID, commit.User.ID)
+	require.Equal(t, float64(42), commit.User.Balance)
+	require.True(t, commit.User.CentralManaged)
+	err = store.auth.AuthEnsureEmailOAuthIdentity(ctx, commit.User.ID, identity.EmailOAuthIdentityInput{ProviderType: "github", ProviderKey: "github", ProviderSubject: "delayed-legacy-subject", Email: commit.User.Email, EmailVerified: true})
+	require.ErrorIs(t, err, identity.ErrCentralLoginRequired)
+	var legacyBindings int
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM auth_identities WHERE user_id=$1 AND provider_subject='delayed-legacy-subject'", commit.User.ID).Scan(&legacyBindings))
+	require.Zero(t, legacyBindings)
+	legacy := identity.NewSessionService(identity.SessionOptions{Secret: "test-secret", ExpireHour: 1}, store.auth.Users, nil, nil, nil)
+	_, err = legacy.GenerateToken(ctx, commit.User)
+	require.ErrorIs(t, err, identity.ErrCentralLoginRequired)
+
+	denied := input.Status
+	denied.Revision, denied.SecurityEpoch, denied.Eligibility = 2, 2, identity.CentralEligibilitySuspended
+	require.NoError(t, store.RecordAccountStatus(ctx, denied))
+	session, status, _, err := store.PublishAndRead(ctx, commit.Session.Digest, input.Status)
+	require.NoError(t, err)
+	require.Equal(t, denied, status)
+	require.Equal(t, uint64(1), session.SecurityEpoch)
+	require.Error(t, identity.AuthorizeCentralSession(input.Policy, session, status, now, now, identity.CentralAccessOrdinary))
+	require.NoError(t, store.RevokeSession(ctx, commit.Session.Digest, now))
+	require.NoError(t, store.RevokeSession(ctx, commit.Session.Digest, now.Add(time.Second)))
+	session, err = store.ReadSession(ctx, commit.Session.Digest)
+	require.NoError(t, err)
+	require.Equal(t, &now, session.RevokedAt)
+	require.Equal(t, commit.Session.Admission, session.Admission)
+	var keys int
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM api_keys WHERE user_id=$1", user.ID).Scan(&keys))
+	require.Equal(t, 1, keys)
+	_, err = db.ExecContext(ctx, "DELETE FROM central_identity_sessions WHERE local_user_id=$1", user.ID)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "DELETE FROM central_identity_bindings WHERE local_user_id=$1", user.ID)
+	require.NoError(t, err)
+	owner, err = store.auth.Users.GetByID(context.Background(), user.ID)
+	require.NoError(t, err)
+	require.True(t, owner.CentralManaged, "missing binding must not silently restore legacy human authentication")
+}
+
+// TestCentralStoreOwnerProofAfterUserLock holds the real local account row
+// while binding waits. Only the existing observation clock advances, proving
+// the proof is rechecked after lock acquisition without sleeping out its budget.
+func TestCentralStoreOwnerProofAfterUserLock(t *testing.T) {
+	store, db, now := centralStoreFixture(t)
+	for _, row := range []struct {
+		name    string        // isolated local-proof deadline boundary
+		advance time.Duration // clock movement while the row lock is held
+		want    error         // expected binding outcome after acquisition
+	}{
+		{"fresh", 5 * time.Second, nil},
+		{"cutoff", 10 * time.Second, identity.ErrCentralProofRequired},
+		{"expired", 15 * time.Second, identity.ErrCentralProofRequired},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			user := &identity.User{Email: row.name + "@example.invalid", PasswordHash: "fixture-owner-hash", Role: "user", Status: "active", Concurrency: 2}
+			require.NoError(t, store.auth.Users.Create(ctx, user))
+			_, err := db.ExecContext(ctx, "UPDATE users SET totp_enabled=true,totp_secret_encrypted='sealed-factor',totp_enabled_at=$2 WHERE id=$1", user.ID, now.Add(-time.Hour))
+			require.NoError(t, err)
+			owner, err := store.auth.Users.GetByID(ctx, user.ID)
+			require.NoError(t, err)
+			input := centralCompletion(now, "proof-"+row.name, "unused@example.invalid", "proof-session-"+row.name)
+			input.NewUser = nil
+			input.Intent = identity.CentralLoginIntent{Intent: identity.CentralIntentBind, OwnerProof: &identity.CentralOwnerProof{LocalUserID: user.ID, CredentialFingerprint: identity.CentralOwnerFingerprint(owner), VerifiedAt: now.Add(-identity.CentralAdmissionBudget + 10*time.Second)}}
+			var clock atomic.Int64
+			clock.Store(now.UnixNano())
+			waitingStore := NewCentralSessionStore(db, store.client, store.auth, func() time.Time { return time.Unix(0, clock.Load()).UTC() })
+			holder, err := db.BeginTx(ctx, nil)
+			require.NoError(t, err)
+			defer func() { _ = holder.Rollback() }()
+			var holderPID int
+			require.NoError(t, holder.QueryRowContext(ctx, "SELECT pg_backend_pid() FROM users WHERE id=$1 FOR UPDATE", user.ID).Scan(&holderPID))
+			completed := make(chan error, 1)
+			go func() {
+				_, err := waitingStore.CompleteLogin(ctx, input)
+				completed <- err
+			}()
+			waitCentralStoreLock(t, ctx, db, holderPID, "users")
+			clock.Store(now.Add(row.advance).UnixNano())
+			require.NoError(t, holder.Commit())
+			err = receiveCentralStoreResult(ctx, completed)
+			if row.want == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, row.want)
+			}
+			var managed bool
+			var bindings, sessions int
+			require.NoError(t, db.QueryRowContext(ctx, "SELECT central_managed FROM users WHERE id=$1", user.ID).Scan(&managed))
+			require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM central_identity_bindings WHERE local_user_id=$1", user.ID).Scan(&bindings))
+			require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM central_identity_sessions WHERE local_user_id=$1", user.ID).Scan(&sessions))
+			if row.want == nil {
+				require.True(t, managed)
+				require.Equal(t, 1, bindings)
+				require.Equal(t, 1, sessions)
+			} else {
+				require.False(t, managed)
+				require.Zero(t, bindings)
+				require.Zero(t, sessions)
+			}
+		})
+	}
+}
+
+// TestCentralStoreStatusWaitsForFirstBinding holds session insertion after the
+// production transaction has created its uncommitted binding. A newer denial
+// must wait for that owner, respect cancellation, and survive a later stale read.
+func TestCentralStoreStatusWaitsForFirstBinding(t *testing.T) {
+	store, db, now := centralStoreFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	input := centralCompletion(now, "first-observation", "first-observation@example.invalid", "first-observation-session")
+	// Status alone never creates local ownership for a genuinely unbound account.
+	// The following first login remains the only operation allowed to establish it.
+	require.NoError(t, store.RecordAccountStatus(ctx, input.Status))
+	var bindings int
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM central_identity_bindings").Scan(&bindings))
+	require.Zero(t, bindings)
+	holder, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = holder.Rollback() }()
+	_, err = holder.ExecContext(ctx, "LOCK TABLE central_identity_sessions IN SHARE MODE")
+	require.NoError(t, err)
+	var holderPID int
+	require.NoError(t, holder.QueryRowContext(ctx, "SELECT pg_backend_pid()").Scan(&holderPID))
+	loginDone := make(chan error, 1)
+	go func() {
+		_, err := store.CompleteLogin(ctx, input)
+		loginDone <- err
+	}()
+	loginPID := waitCentralStoreLock(t, ctx, db, holderPID, "INSERT INTO central_identity_sessions")
+	denied := input.Status
+	denied.Revision, denied.SecurityEpoch, denied.Eligibility = 2, 2, identity.CentralEligibilitySuspended
+	observationCtx, cancelObservation := context.WithCancel(ctx)
+	defer cancelObservation()
+	cancelled := make(chan error, 1)
+	go func() { cancelled <- store.RecordAccountStatus(observationCtx, denied) }()
+	waitCentralStoreLock(t, ctx, db, loginPID, "pg_advisory_xact_lock")
+	cancelObservation()
+	require.ErrorIs(t, receiveCentralStoreResult(ctx, cancelled), identity.ErrCentralUnavailable)
+	observed := make(chan error, 1)
+	go func() { observed <- store.RecordAccountStatus(ctx, denied) }()
+	waitCentralStoreLock(t, ctx, db, loginPID, "pg_advisory_xact_lock")
+	require.NoError(t, holder.Commit())
+	require.NoError(t, receiveCentralStoreResult(ctx, loginDone))
+	require.NoError(t, receiveCentralStoreResult(ctx, observed))
+	session, status, user, err := store.PublishAndRead(ctx, input.Session.Digest, input.Status)
+	require.NoError(t, err)
+	require.True(t, user.CentralManaged)
+	require.Equal(t, denied, status)
+	require.Equal(t, uint64(1), session.SecurityEpoch)
+	require.Error(t, identity.AuthorizeCentralSession(input.Policy, session, status, now, now, identity.CentralAccessOrdinary))
+}
+
+// waitCentralStoreLock observes a specific PostgreSQL blocking relationship.
+// Query text identifies the store boundary, so elapsed time cannot substitute
+// for evidence that the competing operation actually reached its intended lock.
+func waitCentralStoreLock(t *testing.T, ctx context.Context, db *sql.DB, blocker int, statement string) int {
+	t.Helper()
+	var waiter int
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(ctx, `SELECT pid FROM pg_stat_activity
+ WHERE datname=current_database() AND wait_event_type='Lock'
+ AND $1::int=ANY(pg_blocking_pids(pid)) AND strpos(query,$2)>0 LIMIT 1`, blocker, statement).Scan(&waiter)
+		return err == nil
+	}, 5*time.Second, 10*time.Millisecond, "no store query %q blocked behind backend %d", statement, blocker)
+	return waiter
+}
+
+// receiveCentralStoreResult waits for one asynchronous persistence outcome.
+// Buffered result channels let cancelled writers release their transaction even
+// when a failed assertion has already stopped the test from receiving results.
+func receiveCentralStoreResult(ctx context.Context, result <-chan error) error {
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}

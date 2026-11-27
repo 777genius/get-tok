@@ -2,6 +2,9 @@ package httpapi
 
 import (
 	"github.com/gin-gonic/gin"
+
+	"github.com/TokenFlux/TokenRouter/internal/identity"
+	"github.com/TokenFlux/TokenRouter/internal/identity/httpapi/authctx"
 )
 
 // authentication.go dispatches authentication requests to assembled session
@@ -9,7 +12,9 @@ import (
 // Authentication routes share one assembled set of session, pending, and
 // provider handlers. Dispatch passes the request to the selected child
 // instance, so validation, cookie changes, and response writing stay with the
-// handler that implements that login or continuation flow.
+// handler that implements that login or continuation flow. Session withdrawal
+// selects the authenticated principal or the durable cookie-fallback rule;
+// an inert cookie retained after logout cannot replace a later legacy owner.
 
 // AuthenticationHandler retains the assembled login handlers used by identity
 // route dispatch.
@@ -18,6 +23,7 @@ type AuthenticationHandler struct {
 	// the child for every registered route before serving; methods directly
 	// dispatch through these pointers and do not supply replacements.
 	Session  *SessionHandler      // password and session HTTP operations
+	Central  *CentralHandler      // optional central cookie authentication
 	Pending  *PendingHandler      // browser pending identity operations
 	Bind     *OAuthBindHandler    // temporary current-user binding cookies
 	LinuxDo  *LinuxDoHandler      // LinuxDo OAuth HTTP operations
@@ -189,9 +195,19 @@ func (h *AuthenticationHandler) Login(c *gin.Context) { h.Session.Login(c) }
 // challenge and completes its account or pending binding.
 func (h *AuthenticationHandler) Login2FA(c *gin.Context) { h.Session.Login2FA(c) }
 
-// Logout delegates to the child handler that attempts refresh-token revocation
-// and invokes the configured browser pending logout callback.
-func (h *AuthenticationHandler) Logout(c *gin.Context) { h.Session.Logout(c) }
+// Logout routes withdrawal to the legacy handler when no central cookie exists
+// or durable storage confirms that its session is revoked or expired.
+// Legacy logout accepts its optional refresh payload without an access token;
+// every live or unobserved central cookie retains the central proof checks.
+func (h *AuthenticationHandler) Logout(c *gin.Context) {
+	if h.Central != nil && h.Central.HasCookie(c) && !h.Central.hasInertCookie(c) {
+		h.Central.Logout(c)
+		return
+	}
+	// The legacy handler owns optional refresh decoding and pending cleanup, so
+	// selection leaves the request body untouched for that established contract.
+	h.Session.Logout(c)
+}
 
 // OIDCOAuthCallback delegates to the child handler that validates configured
 // OIDC token proof and resolves a namespaced provider subject.
@@ -220,9 +236,21 @@ func (h *AuthenticationHandler) Register(c *gin.Context) { h.Session.Register(c)
 // email reset credential and replacement password through authentication.
 func (h *AuthenticationHandler) ResetPassword(c *gin.Context) { h.Session.ResetPassword(c) }
 
-// RevokeAllSessions delegates to the child handler that requests
-// refresh-session revocation for the currently authenticated account.
-func (h *AuthenticationHandler) RevokeAllSessions(c *gin.Context) { h.Session.RevokeAllSessions(c) }
+// RevokeAllSessions selects withdrawal from the principal already established
+// by authentication middleware. A retained cookie cannot redirect a current
+// legacy owner into another account's central handler, and a central principal
+// without its assembled handler fails closed.
+func (h *AuthenticationHandler) RevokeAllSessions(c *gin.Context) {
+	if authctx.IsCentral(c) {
+		if h.Central == nil {
+			centralHTTPError(c, identity.ErrCentralUnavailable)
+			return
+		}
+		h.Central.RevokeAll(c)
+		return
+	}
+	h.Session.RevokeAllSessions(c)
+}
 
 // SendPendingOAuthVerifyCode delegates to the child handler that requests
 // signup email proof for the current browser-bound pending provider flow.

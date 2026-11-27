@@ -6,6 +6,7 @@
 
 - [配置分层](#配置分层)：先确定一个选项属于哪一层。
 - [进程配置来源](#进程配置来源)：修改默认值、YAML 或环境变量时读取。
+- [共享身份配置](#shared_identity_configuration)：配置独立的 Identity authority、浏览器来源和服务凭据时读取。
 - [首次初始化](#首次初始化)：修改 setup 和安全密钥引导时读取。
 - [数据库运行时设置](#数据库运行时设置)：修改管理员设置和热更新时读取。
 - [领域配置](#领域配置)：业务实体用专用表，不放进通用键值设置。
@@ -48,6 +49,31 @@
 加载完成后，依次做字符串规范化、枚举回退、派生默认值、读取文件和完整的 `Validate`。安全 header、URL、数值范围、模式组合无效，或缺少必要的 secret 时，启动失败，问题在启动时就会暴露。自动生成的 TOTP key 只适合开发环境，`EncryptionKeyConfigured=false` 时后台不会把 TOTP 当成生产可用的配置。
 
 环境变量优先于 YAML，所以排查"改了文件不生效"时，先检查容器的环境变量。数据库密码、JWT 和 TOTP secret、OAuth secret、对象存储 secret 和提供商凭据，都不会出现在日志、错误或管理响应里。
+
+<a id="shared_identity_configuration"></a>
+### 共享身份配置
+
+`central_identity` 是默认关闭的进程配置，校验在监听 HTTP 之前完成。它和数据库里的通用 OIDC 设置互相独立；修改通用 OIDC issuer、client 或 scope 不会改变已选定的共享身份 authority。环境变量使用 `CENTRAL_IDENTITY_` 前缀，例如 `CENTRAL_IDENTITY_ENABLED`。
+
+| 配置 | 默认值与约束 |
+| --- | --- |
+| `enabled` | `false`；已有安装保留现有登录方式 |
+| `origin` | 必填的浏览器精确 origin，不带路径或尾斜线；回调固定为该 origin 下的 `/api/v1/auth/central/callback` |
+| `api_url` | 必填的 Identity Connect 服务地址；不能带凭据、查询参数或 fragment |
+| `issuer_url` | 必填的 Keycloak realm issuer，必须与签名 token 的 issuer 完全一致 |
+| `authority_incarnation` | 必填的 authority 连续性标识；账户恢复或重新部署不得默默复用已失效的连续性 |
+| `consumer_id` | `gettok`；须与 Identity 为客户端配置的 consumer 一致 |
+| `client_id`、`client_secret` | 服务端持有的 confidential human client，用于 Authorization Code + PKCE |
+| `workload_client_id`、`workload_client_secret` | 独立的只读状态客户端；client ID 必须与 human client 不同 |
+| `provider_name`、`providers` | 显示名默认 `Agent Teams`；broker alias 默认 `github`、`gitlab`，最多 8 个，必须唯一且只含小写字母、数字、`_`、`-` |
+| `test_loopback` | `false`；显式开启后，所有端点必须是 loopback，才允许 HTTP 和单独命名的非 Secure TEST cookie |
+| `test_binding_profile` | 空字符串；仅 loopback TEST 可选择 `test-password-totp-v1`，生产迁移没有可用别名 |
+
+生产形式的配置只接受 HTTPS。启用共享身份且未选择 loopback TEST 时，必须提供固定的 `totp.encryption_key`（`TOTP_ENCRYPTION_KEY`），用于保存浏览器事务密文；自动生成的临时密钥不满足这个条件。多副本使用同一把密钥并随数据库备份。
+
+Keycloak 的 human client 必须输出本接入所需的 `sub`、`sid`、`auth_time`、`exp`、`iat`、audience 和 scope；GetTok 使用 `openid email profile`，userinfo 的 `sub` 必须与签名 ID token 一致。workload client 只申请 `identity.status:read`。客户端、realm 和允许的 admission policy 由 Identity 独立校验，不能靠 GetTok 的字段填充值授予权限。
+
+当前普通登录固定使用 `gettok-ordinary-login` policy version 1。独立连续性及敏感操作没有启用开关；未通过对应机制验证前，受保护资源返回 `CENTRAL_PROOF_REQUIRED`。backend mode 下不开始或完成新的共享登录，能力接口返回关闭，已有 session 的 bootstrap 和退出仍可使用。部署及恢复约束见[共享身份部署](../operations/shared_identity_deployment.md)。
 
 ### 网关和时区
 

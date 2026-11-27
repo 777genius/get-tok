@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,8 @@ import (
 // connection before joining its reader. Upgrade receives an explicit
 // timing-header map; Gorilla constructs its 101 response from that map rather
 // than the response writer's ordinary Header map.
+// A request-local upgrader preserves server branding preference independently
+// of the client's subprotocol order without changing the shared policy.
 
 // These environment names, origin modes, admission defaults, and frame budgets
 // configure the Ops WebSocket handshake and ongoing socket loop.
@@ -74,8 +77,8 @@ var (
 	// policy used by both handshake and address helpers.
 	opsWSProxyConfig = loadOpsWSProxyConfigFromEnv()
 
-	// upgrader applies this adapter's Origin decision and negotiates supported
-	// administrator branding through Gorilla's handshake implementation.
+	// upgrader holds the immutable Origin policy and supported administrator
+	// branding; upgradeOpsWS copies it before selecting a request's subprotocol.
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return isAllowedOpsWSOrigin(r)
@@ -163,7 +166,7 @@ func (h *OpsHandler) QPSWSHandler(c *gin.Context) {
 	// receive the application code; failed upgrades may already have committed
 	// Gorilla's error response.
 	if !h.opsService.IsRealtimeMonitoringEnabled(c.Request.Context()) {
-		conn, err := upgrader.Upgrade(c.Writer, c.Request, servermiddleware.ServerTimingResponseHeader(c))
+		conn, err := upgradeOpsWS(c.Writer, c.Request, servermiddleware.ServerTimingResponseHeader(c))
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "ops realtime monitoring is disabled"})
 			return
@@ -203,7 +206,7 @@ func (h *OpsHandler) QPSWSHandler(c *gin.Context) {
 	// Pass the explicit timing-header map to Gorilla, which constructs 101 after
 	// Hijack from these supplied headers rather than the writer's ordinary header
 	// map.
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, servermiddleware.ServerTimingResponseHeader(c))
+	conn, err := upgradeOpsWS(c.Writer, c.Request, servermiddleware.ServerTimingResponseHeader(c))
 	if err != nil {
 		logger.LegacyPrintf("handler.admin.ops_ws", "[OpsWS] upgrade failed: %v", err)
 		return
@@ -216,6 +219,30 @@ func (h *OpsHandler) QPSWSHandler(c *gin.Context) {
 	}()
 
 	handleQPSWebSocket(c.Request.Context(), conn, rt)
+}
+
+// upgradeOpsWS negotiates the first server-preferred administrator subprotocol
+// offered by the client. Each handshake receives a local upgrader copy with at
+// most one protocol, preserving current-before-legacy branding even when Gorilla
+// follows client preference. The shared policy and request headers remain
+// unchanged, so concurrent handshakes cannot rewrite another request's supported
+// protocols. An unmatched offer selects no protocol, and JWT inputs are never
+// echoed as the response subprotocol.
+func upgradeOpsWS(w http.ResponseWriter, r *http.Request, responseHeader http.Header) (*websocket.Conn, error) {
+	requestUpgrader := upgrader
+	// A non-nil empty list also prevents Gorilla's response-header fallback when
+	// the client offers no supported brand, including when it offers only a JWT.
+	requestUpgrader.Subprotocols = []string{}
+	offered := websocket.Subprotocols(r)
+	// Restrict each handshake to the first server-preferred match because Gorilla
+	// otherwise prefers the client's order when several supported brands match.
+	for _, supported := range upgrader.Subprotocols {
+		if slices.Contains(offered, supported) {
+			requestUpgrader.Subprotocols = []string{supported}
+			break
+		}
+	}
+	return requestUpgrader.Upgrade(w, r, responseHeader)
 }
 
 // handleQPSWebSocket pushes cached payloads and pings while one reader handles

@@ -7,7 +7,9 @@
 - [核心实体](#核心实体)：用户、身份、会话和团队各是什么。
 - [认证入口](#认证入口)：公开入口、JWT 和管理员凭据。
 - [会话生命周期](#会话生命周期)：修改签发、刷新、撤销和绑定时读取。
+- [共享身份会话](#shared_identity_sessions)：修改中央账户绑定、有限 admission 或旧账户迁移时读取。
 - [强认证与敏感操作](#强认证与敏感操作)：修改 TOTP、Passkey 或管理员 step-up 时读取。
+- [中央身份测试会话的资源范围](#central_resource_scope)：修改中央会话对个人、团队、凭据和用量的访问时读取。
 - [外部身份接入](#外部身份接入)：修改 OAuth 登录、绑定或账号接纳时读取。
 - [登录提供方差异](#登录提供方差异)：各登录提供方的主体、邮箱和完成流程。
 - [身份绑定与解绑](#身份绑定与解绑)：修改当前用户绑定、首次绑定权益或会话撤销时读取。
@@ -73,10 +75,28 @@ Google One Tap 是 Google 登录在浏览器端的另一个凭据入口，身份
 
 1. 只接受配置的 HMAC 签名方法，限制 token 长度，解析签发时间和过期时间。
 2. 从数据库读取当前用户，用户不存在、已删除或未启用时拒绝。
-3. 比较声明里的 `token_version` 和 `ResolvedTokenVersion` 得到的当前凭据指纹。指纹由规范化后的邮箱和 `password_hash` 推导；声明与当前指纹不一致时拒绝。
-4. 开启会话绑定时，校验 JWT 的客户端绑定摘要 `bnd`，然后把当前用户 ID、邮箱和角色写入 Gin 上下文。
+3. 当前用户为 `central_managed` 时拒绝旧 JWT；判断使用本次数据库读取，不依赖历史登录或缓存快照。账户绑定后，旧 human 凭据不能重新进入 legacy 登录路径。
+4. 比较声明里的 `token_version` 和 `ResolvedTokenVersion` 得到的当前凭据指纹。指纹由规范化后的邮箱和 `password_hash` 推导；声明与当前指纹不一致时拒绝。
+5. 开启会话绑定时，校验 JWT 的客户端绑定摘要 `bnd`，然后把当前用户 ID、邮箱和角色写入 Gin 上下文。
 
 管理员路由接受两种凭据，能力不完全相同。管理员 JWT 照常检查用户状态和 token version。`x-api-key` 管理密钥代表配置里的第一个实际管理员账户。敏感设置开启 step-up 后，管理密钥无法通过二次验证，需要使用带有效 `sid` 的管理员 JWT。WebSocket 场景可以从约定的子协议里读取 JWT，同样检查当前用户。
+
+<a id="shared_identity_sessions"></a>
+## 共享身份会话
+
+共享身份显式启用后，`CentralFlow` 在身份核心内编排登录，HTTP、OIDC、Connect 和 PostgreSQL 保持适配层边界。中央账户用 `(authority_incarnation, account_id)` 标识；verified provider 的 `(issuer, sub)` 单独保存。GetTok 的 `users.id`、余额、团队归属、订阅和机器凭据继续由本地产品持有，provider 邮箱只作可验证的注册资料。
+
+`central_identity_bindings` 保存持久的一对一账户归属和单调递增的状态观察；`users.central_managed` 是独立的永久认证栅栏。首次绑定把归属、栅栏和 session 放入同一事务。删除或丢失外部 binding 不会清除栅栏，关闭接入开关也不会重新开放旧密码、旧 OAuth、已签发 JWT 或 refresh token。旧账户请求每次重新读取当前用户，不能依赖失效通知成功来关闭旧 human 入口。
+
+浏览器事务把 intent、PKCE verifier、nonce、邀请码和可选 TEST owner proof 加密保存，绑定随机 state 与 browser cookie，最多 5 分钟，只能消费一次。`ResolveSelf` 使用本次 human access credential，由 Identity 决定主体和 consumer。随后冻结 admission、security epoch、attachment generation 和 session deadline。后续 `GetAccountStatus` 只使用独立 workload client；它能撤销已有 session 的可用性，不能重建 attachment、增加 proof、改写原 epoch/generation 或延长期限。
+
+状态观察总预算为 60 秒，包含 5 秒时钟不确定性。每个请求重新取得中央状态，使用持久锁发布较新的状态后才准入；同一 revision 的身份事实不能变化，较旧 ACTIVE 不能覆盖已见的停用，CLOSED 不可回到 ACTIVE。当前普通 admission 的实际认证时间来自已验证流程的 `auth_time`，最大 flow age 为 8 小时；session 的绝对期限取本地 5 分钟、中央 admission 期限与 ID-token 期限的最小值。workload 缓存不更新这个期限。
+
+这里没有把账户 ACTIVE 解释成 Keycloak `sid` 仍在线。初始普通 profile 不保存 upstream refresh token，也没有自动续期或生产 back-channel logout 承诺；原生 Keycloak logout 的最坏延迟受原 human credential 和本地 session 的有限期限约束。GetTok 本地 logout、当前用户停用及中央 epoch/attachment/lifecycle 变化另有请求时的拒绝路径。
+
+旧账户迁移默认关闭。`test-password-totp-v1` 仅在 loopback TEST 可用，要求已登录旧账户并再次提供密码和已经存在的 TOTP；提交时锁住同一用户并复核邮箱/密码版本、factor 状态、启用时间和 proof age。当前 JWT 本身不能建立归属。这个候选没有证明现有邮箱恢复不会绕过独立因子，因此没有生产迁移别名；已有 OAuth-only 或 Passkey-only 账户继续使用原登录，不移动资产、不按邮箱合并。
+
+普通中央登录不能推出独立连续性。团队、管理、凭据管理和其他受保护资源的检查见[中央资源范围](#central_resource_scope)。迁移 308、保存期限及回退限制见[共享身份部署](../operations/shared_identity_deployment.md)。
 
 ## 会话生命周期
 
@@ -112,6 +132,26 @@ TOTP 密钥加密后持久化，设置流程和登录挑战使用带过期时间
 Passkey 使用 WebAuthn 的注册和登录流程：持久凭据和短期的 challenge、session 分开存放，finish 只能消费与之匹配的流程状态。启用腾讯天御或阿里云验证码时，匿名登录的 begin 要先消费验证码票据，finish 不再携带或校验票据。注册入口要求用户已登录。登录的 finish 最终签发标准的 token 对，并经过同样的用户状态、版本和会话约束，Passkey 没有单独的授权体系。
 
 Passkey 核心通过验证接口接收响应内容：先消费 session，再由 provider 里的 WebAuthn SDK 解析和验证。credential 响应损坏时，已经消费的挑战也无法重放。
+
+<a id="central_resource_scope"></a>
+## 中央身份测试会话的资源范围
+
+中央身份的首个接入使用 `provider-session-control-v1` 测试档案。它证明当前提供方会话的控制权，没有独立因子的连续性保证。`INDEPENDENT_CONTINUITY_V1` 在完成真实提供方机制验证前保持不可签发，因此中央会话目前只能使用已经实现个人资源范围的普通操作。GetTok 的角色、团队成员关系和资源所有权继续由本地业务规则判断。
+
+当前测试策略在 HTTP 资源入口额外限制以下操作：
+
+| 操作 | 中央会话需要的证明 |
+| --- | --- |
+| `/keys` 的列表、详情、创建、修改、轮换和删除 | Sensitive；列表和详情也返回完整凭据，所以个人 Key 同样受限 |
+| `/groups/available`、`/groups/rates`、`/keys/billing-options` 的 `scope=team` | Organizational；个人 scope 仍使用本人的授权和订阅 |
+| 用量列表、汇总、趋势、模型及分组图表 | 普通会话在 SQL 中强制 `PersonalOnly=true`、`IncludeOwnedTeam=false`；客户端参数不能放宽范围 |
+| `/usage/dashboard/stats` | 普通会话使用个人查询，Key 计数、累计、今日和近期速率都排除持久的团队归属 |
+| `/usage/:id` | 除本人 actor 检查外，记录的 `team_id` 非空时需要 Organizational |
+| 用量错误列表及详情、批量 Key 用量、单个 Key 日用量 | Organizational；这些既有 reader 暂时没有完整的个人资源范围契约 |
+
+这些约束是未完成强认证验证时的保守测试策略，不能视为所有者已经批准的生产敏感操作清单，也不能据此宣称完整的 GetTok 接入已经开放。生产操作分类和强证明档案需要随对应的验证结果固定。既有 JWT 和机器凭据继续使用原有的业务权限规则。
+
+证明不足返回 HTTP 403 和稳定原因 `CENTRAL_PROOF_REQUIRED`，保留仍然有效的普通会话；前端不能把它当成身份失效并退出登录。查询端直接约束每条 Key 或用量记录的 `team_id`，不先通过“当前有没有团队”决定范围，因此加入团队、转移所有权或离开团队都不会使个人查询扩大。缺少个人查询能力时返回 `USAGE_SCOPE_UNAVAILABLE`，不会退回丢失范围参数的旧接口。查询缓存包含个人范围、包含自有团队的开关和模型解释来源，较宽的结果不会复用于个人请求。
 
 ## 外部身份接入
 

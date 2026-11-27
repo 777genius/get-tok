@@ -15,6 +15,7 @@ import { AppLayout, AuthLayout } from '@/components/layout'
 // src/router/index.ts
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
+import { installRouteGuards } from '@/router/guards'
 
 // Views
 import DashboardView from '@/views/DashboardView.vue'
@@ -118,20 +119,8 @@ const router = createRouter({
   routes
 })
 
-// Navigation guards
-router.beforeEach((to, from, next) => {
-  const authStore = useAuthStore()
-
-  if (to.meta.requiresAuth && !authStore.isAuthenticated) {
-    // Redirect to login if not authenticated
-    next('/login')
-  } else if (to.meta.requiresAdmin && !authStore.isAdmin) {
-    // Redirect to dashboard if not admin
-    next('/dashboard')
-  } else {
-    next()
-  }
-})
+// Reuse the session restoration and access checks owned by the application router.
+installRouteGuards(router)
 
 export default router
 ```
@@ -152,11 +141,8 @@ const pinia = createPinia()
 app.use(pinia)
 app.use(router)
 
-// Initialize auth state on app startup
-import { useAuthStore } from '@/stores'
-const authStore = useAuthStore()
-authStore.checkAuth()
-
+// Let the installed route guard restore the session before the first view mounts.
+await router.isReady()
 app.mount('#app')
 ```
 
@@ -473,9 +459,9 @@ const sidebarCollapsed = computed(() => appStore.sidebarCollapsed)
 
 ### User info not displaying
 
-- Ensure auth store is initialized with `checkAuth()`
+- Ensure the installed route guard awaits `initializeSession()` before access checks
 - Verify user is logged in
-- Check localStorage for auth data
+- Central session data stays in memory; only legacy credentials use localStorage
 
 ### Mobile menu not working
 

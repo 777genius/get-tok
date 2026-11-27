@@ -1429,10 +1429,10 @@ async function fetchHomeStats() {
   }
 }
 
-// Start the tracked icon rotation before awaiting public settings, then request
-// both default-page data sources together only when custom home content is absent.
+// The route guard owns session restoration, including failures that leave public
+// browsing anonymous. Start the tracked icon rotation before awaiting public settings,
+// then request both default-page data sources only when custom home content is absent.
 onMounted(async () => {
-  authStore.checkAuth()
   homeMarketplaceButtonIconTimer = window.setInterval(() => {
     if (homeMarketplaceButtonBrands.value.length <= 1) {
       return

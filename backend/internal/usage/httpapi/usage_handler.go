@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/TokenFlux/TokenRouter/internal/billing/pricing"
+	"github.com/TokenFlux/TokenRouter/internal/identity"
 	"github.com/TokenFlux/TokenRouter/internal/identity/httpapi/authctx"
 	"github.com/TokenFlux/TokenRouter/internal/ops"
 	"github.com/TokenFlux/TokenRouter/internal/pkg/locale"
@@ -23,10 +24,10 @@ import (
 
 // usage_handler.go serves authenticated user usage history, rankings, error
 // records, and dashboard reports.
-// User usage reports bind visibility to the authenticated actor and include
-// its owned team's records through repository scope. Direct record detail is
-// stricter: the stored actor must match the requester before request metadata
-// is exposed.
+// User usage reports bind visibility to the authenticated actor. Legacy or
+// qualified organizational sessions can include owned-team records; ordinary
+// central sessions carry an explicit personal-only SQL restriction. Direct
+// detail checks the stored actor and team attribution before exposing metadata.
 //
 // Optional list bounds remain absent until supplied, while chart defaults
 // select a calendar or period range. Request-ID queries keep omitted filter
@@ -34,6 +35,10 @@ import (
 // formatting exposes charged costs and measured usage while omitting provider
 // costs and outbound breakdowns. Ranking response pointers keep visible zero
 // metrics distinct from fields hidden by the supplied visibility settings.
+// Readers without a personal-scope contract, including Ops errors and legacy
+// key summaries, require organizational continuity for central sessions. These
+// denials preserve the valid ordinary session and never infer permission from
+// the user's current team membership or a browser-supplied filter.
 
 // Daily key-usage limits bound the default calendar-day count and largest
 // accepted user or public report range.
@@ -230,8 +235,9 @@ func NewUsageHandler(
 
 // parseUserUsageFilters returns actor-scoped selectors and scalar chart
 // bounds, writing an error response when validation fails. Authentication
-// supplies UserID and IncludeOwnedTeam is true; key lookup checks existence
-// while storage applies record visibility.
+// supplies UserID, and central continuity selects personal-only or owned-team
+// visibility. Broader queries check key existence; personal queries send the
+// selector directly to scoped storage so unavailable team keys reveal no metadata.
 //
 // Request category takes precedence over stream. Supplied dates form optional
 // half-open filter bounds, with date-only ends advanced by calendar day. When
@@ -242,31 +248,38 @@ func NewUsageHandler(
 // lists and totals, while scalar chart bounds become epoch through current
 // UTC time. Explicit dates remain in both representations. A false result
 // means callers stop because this helper already wrote the rejection.
+// @project-doc docs/domains/identity_and_tenancy.md#central_resource_scope
 func (h *UsageHandler) parseUserUsageFilters(c *gin.Context, requireRange bool) (*userUsageFilters, bool) {
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
 		return nil, false
 	}
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessOrdinary) {
+		return nil, false
+	}
+	personalOnly := authctx.IsCentral(c) && authctx.CentralAccessError(c, identity.CentralAccessOrganizational) != nil
 
 	var apiKeyID int64
 	if apiKeyIDStr := strings.TrimSpace(c.Query("api_key_id")); apiKeyIDStr != "" {
 		id, err := strconv.ParseInt(apiKeyIDStr, 10, 64)
-		if err != nil {
+		if err != nil || id <= 0 {
 			response.BadRequest(c, "Invalid api_key_id")
 			return nil, false
 		}
-		if h.apiKeyService == nil {
-			response.InternalError(c, "API key service not available")
-			return nil, false
+		if !personalOnly {
+			if h.apiKeyService == nil {
+				response.InternalError(c, "API key service not available")
+				return nil, false
+			}
+			_, err = h.apiKeyService.GetByID(c.Request.Context(), id)
+			if err != nil {
+				response.ErrorFrom(c, err)
+				return nil, false
+			}
 		}
-		_, err = h.apiKeyService.GetByID(c.Request.Context(), id)
-		if err != nil {
-			response.ErrorFrom(c, err)
-			return nil, false
-		}
-		// Lookup establishes key existence. Repository actor and owned-team scope
-		// still restricts records while owners select another member's team key for reports.
+		// A filter is not an authorization grant. Personal SQL scope handles missing,
+		// foreign and team keys uniformly without first reading their credential metadata.
 		apiKeyID = id
 	}
 
@@ -402,7 +415,8 @@ func (h *UsageHandler) parseUserUsageFilters(c *gin.Context, requireRange bool) 
 			UserID:             subject.UserID,
 			APIKeyID:           apiKeyID,
 			GroupID:            groupID,
-			IncludeOwnedTeam:   true,
+			IncludeOwnedTeam:   !personalOnly,
+			PersonalOnly:       personalOnly,
 			Model:              strings.TrimSpace(c.Query("model")),
 			ModelFilterSource:  usage.ModelSourceRequested,
 			RequestType:        requestType,
@@ -418,9 +432,10 @@ func (h *UsageHandler) parseUserUsageFilters(c *gin.Context, requireRange bool) 
 	}, true
 }
 
-// List returns an authenticated actor and owned-team usage page under
-// optional filters. Missing dates remain unrestricted, sorting is passed to
-// storage, and nested DTO display uses the request locale.
+// List returns an authenticated actor's usage page under authorized report
+// scope and optional filters. Ordinary central sessions exclude every team row
+// in storage. Missing dates remain unrestricted, sorting reaches storage, and
+// nested DTO display uses the request locale.
 func (h *UsageHandler) List(c *gin.Context) {
 	page, pageSize := response.ParsePagination(c)
 	parsed, ok := h.parseUserUsageFilters(c, false)
@@ -451,7 +466,12 @@ func (h *UsageHandler) List(c *gin.Context) {
 // ListErrors returns redacted failed requests after server-side error-view
 // permission is checked. It caps pages at one hundred, accepts date-only
 // ranges and optional error selectors, and requires an available Ops reader.
+// Central sessions require organizational continuity because this reader cannot
+// exclude team-attributed errors using a persisted resource-scope predicate.
 func (h *UsageHandler) ListErrors(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessOrganizational) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -541,8 +561,12 @@ func (h *UsageHandler) ListErrors(c *gin.Context) {
 
 // GetErrorDetail returns one redacted failure under the authenticated user
 // scope. Server-side visibility is checked first, positive IDs are required,
-// and an unavailable Ops reader returns a service-unavailable response.
+// and an unavailable Ops reader returns a service-unavailable response. Central
+// sessions need organizational continuity because the reader omits team attribution.
 func (h *UsageHandler) GetErrorDetail(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessOrganizational) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -572,7 +596,12 @@ func (h *UsageHandler) GetErrorDetail(c *gin.Context) {
 // GetByID returns request metadata only when the record's acting user matches
 // the requester. Lookup errors propagate through HTTP mapping; other actors
 // receive forbidden even when broader reports include owned-team records.
+// Stored team attribution additionally requires organizational continuity for
+// central sessions before any request metadata is included in the response.
 func (h *UsageHandler) GetByID(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessOrdinary) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -595,6 +624,9 @@ func (h *UsageHandler) GetByID(c *gin.Context) {
 	// actor-plus-owned-team reporting scope can include this row for another authenticated requester.
 	if record.UserID != subject.UserID {
 		response.Forbidden(c, "Not authorized to access this record")
+		return
+	}
+	if record.TeamID != nil && !authctx.RequireCentralAccess(c, identity.CentralAccessOrganizational) {
 		return
 	}
 
@@ -737,10 +769,10 @@ func apiKeyDailyUsageRange(days int, userTZ string, calendar timezone.Calendar) 
 	return startTime, endTime
 }
 
-// DashboardStats returns the authenticated user's dashboard counters through
-// UsageService. Missing authentication rejects the read; storage determines
-// retained totals, today's values, platform breakdowns and the current rate
-// observations.
+// DashboardStats returns the authenticated user's counters within the session's
+// permitted scope. Ordinary central sessions select the explicit personal reader,
+// which excludes team keys and team usage in storage. The qualified or legacy
+// path retains the existing actor and owned-team dashboard semantics.
 func (h *UsageHandler) DashboardStats(c *gin.Context) {
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
@@ -748,7 +780,16 @@ func (h *UsageHandler) DashboardStats(c *gin.Context) {
 		return
 	}
 
-	stats, err := h.usageService.GetUserDashboardStats(c.Request.Context(), subject.UserID)
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessOrdinary) {
+		return
+	}
+	var stats *usage.UserDashboardStats
+	var err error
+	if authctx.IsCentral(c) && authctx.CentralAccessError(c, identity.CentralAccessOrganizational) != nil {
+		stats, err = h.usageService.GetPersonalDashboardStats(c.Request.Context(), subject.UserID)
+	} else {
+		stats, err = h.usageService.GetUserDashboardStats(c.Request.Context(), subject.UserID)
+	}
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -941,7 +982,12 @@ func usageFilterDisplayEndDate(endTime time.Time) string {
 // DashboardAPIKeysUsage queries charges for the authenticated actor's owned
 // IDs from a bounded list. More than one hundred inputs is rejected, empty
 // owned subsets return empty stats, and storage receives zero range defaults.
+// Central sessions require organizational continuity because ownership alone
+// does not exclude team-attributed history from the legacy batch query.
 func (h *UsageHandler) DashboardAPIKeysUsage(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessOrganizational) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
@@ -988,8 +1034,12 @@ func (h *UsageHandler) DashboardAPIKeysUsage(c *gin.Context) {
 // GetMyAPIKeyDailyUsage returns daily usage after key lookup proves actor
 // ownership. It validates one through ninety days, requires a key reader, and
 // queries local-calendar bounds using the authenticated user and requested
-// key.
+// key. Central sessions require organizational continuity because this legacy
+// query has no persisted personal-only restriction on its usage rows.
 func (h *UsageHandler) GetMyAPIKeyDailyUsage(c *gin.Context) {
+	if !authctx.RequireCentralAccess(c, identity.CentralAccessOrganizational) {
+		return
+	}
 	subject, ok := authctx.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")

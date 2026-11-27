@@ -27,6 +27,8 @@ type User struct {
 	Email string `json:"email,omitempty"`
 	// PasswordHash holds the value of the "password_hash" field.
 	PasswordHash string `json:"password_hash,omitempty"`
+	// CentralManaged holds the value of the "central_managed" field.
+	CentralManaged bool `json:"central_managed,omitempty"`
 	// Role holds the value of the "role" field.
 	Role string `json:"role,omitempty"`
 	// Balance holds the value of the "balance" field.
@@ -274,7 +276,7 @@ func (*User) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
-		case user.FieldTotpEnabled, user.FieldBalanceNotifyEnabled:
+		case user.FieldCentralManaged, user.FieldTotpEnabled, user.FieldBalanceNotifyEnabled:
 			values[i] = new(sql.NullBool)
 		case user.FieldBalance, user.FieldFrozenBalance, user.FieldBalanceNotifyThreshold, user.FieldTotalRecharged:
 			values[i] = new(sql.NullFloat64)
@@ -335,6 +337,12 @@ func (_m *User) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field password_hash", values[i])
 			} else if value.Valid {
 				_m.PasswordHash = value.String
+			}
+		case user.FieldCentralManaged:
+			if value, ok := values[i].(*sql.NullBool); !ok {
+				return fmt.Errorf("unexpected type %T for field central_managed", values[i])
+			} else if value.Valid {
+				_m.CentralManaged = value.Bool
 			}
 		case user.FieldRole:
 			if value, ok := values[i].(*sql.NullString); !ok {
@@ -605,6 +613,9 @@ func (_m *User) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("password_hash=")
 	builder.WriteString(_m.PasswordHash)
+	builder.WriteString(", ")
+	builder.WriteString("central_managed=")
+	builder.WriteString(fmt.Sprintf("%v", _m.CentralManaged))
 	builder.WriteString(", ")
 	builder.WriteString("role=")
 	builder.WriteString(_m.Role)

@@ -143,6 +143,10 @@ const mountChart = async () => {
 
 describe('UserDashboardUsageChart', () => {
   beforeEach(() => {
+    // A fixed local midday gives the current bucket an incoming line segment and
+    // keeps range assertions stable across midnight. Async timers remain real.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2026, 10, 26, 12, 30))
     localStorage.clear()
     vi.mocked(usageAPI.getDashboardTrend).mockReset()
     vi.mocked(usageAPI.getDashboardModels).mockReset()
@@ -154,6 +158,7 @@ describe('UserDashboardUsageChart', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     localStorage.clear()
   })
 

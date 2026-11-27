@@ -9,10 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
 
 	dbent "github.com/TokenFlux/TokenRouter/ent"
 	"github.com/TokenFlux/TokenRouter/ent/authidentity"
+	dbuser "github.com/TokenFlux/TokenRouter/ent/user"
 	billingpostgres "github.com/TokenFlux/TokenRouter/internal/billing/postgres"
 	identitycore "github.com/TokenFlux/TokenRouter/internal/identity"
 	infraerrors "github.com/TokenFlux/TokenRouter/internal/pkg/apperror"
@@ -28,7 +30,7 @@ import (
 //
 // Transaction selection differs by operation. First-bind grants and
 // bound-email updates join an injected Ent transaction or own one, while
-// registered-user creation opens its configured transaction and database-free
+// registered-user creation joins an injected transaction or opens its own, and database-free
 // fixtures call their repositories directly. Optional steps use savepoints
 // when a transaction is injected so their failures can be returned after
 // recovery. Email backfill and timestamp/source observations deliberately
@@ -100,20 +102,24 @@ func (s *AuthState) ApplyProviderDefaultSettingsOnFirstBind(
 }
 
 // AuthApplyProviderDefaultSettingsOnFirstBind records the enabled first-bind
-// claim before applying provider entitlements. Supply the caller transaction
-// covering the marker and later grant participants.
+// claim before applying provider entitlements. It joins the caller transaction
+// or delegates to the wrapper that owns the marker and grant transaction.
 //
 // The unique account/provider/first_bind insert uses do-nothing conflict
 // handling; zero affected rows skip every grant write. A newly inserted claim
 // permits configured balance, concurrency, and subscription defaults in
-// sequence. This method selects the injected transaction client but creates no
-// rollback scope itself, so callers keep claim and entitlement errors inside
-// their shared transaction.
+// sequence. PostgreSQL locks the current account row before the claim so a delayed
+// legacy provider callback cannot grant entitlements after central ownership
+// activation. Errors remain inside the shared transaction and require rollback
+// by its owner, including the wrapper when no transaction was supplied.
 func (s *AuthState) AuthApplyProviderDefaultSettingsOnFirstBind(
 	ctx context.Context,
 	userID int64,
 	providerType string,
 ) error {
+	if dbent.TxFromContext(ctx) == nil {
+		return s.ApplyProviderDefaultSettingsOnFirstBind(ctx, userID, providerType)
+	}
 	providerDefaults, enabled, err := s.Settings.ResolveAuthSourceGrantSettings(ctx, providerType, true)
 	if err != nil {
 		return fmt.Errorf("load auth source defaults: %w", err)
@@ -125,6 +131,11 @@ func (s *AuthState) AuthApplyProviderDefaultSettingsOnFirstBind(
 	client := s.entClient
 	if tx := dbent.TxFromContext(ctx); tx != nil {
 		client = tx.Client()
+	}
+	// Serialize legacy financial side effects with central ownership activation.
+	// A provider callback that passed an earlier login read cannot grant after binding.
+	if err := requireLegacyAuthUser(ctx, client, userID); err != nil {
+		return err
 	}
 
 	// Insert the unique first-bind marker before entitlements and inspect its
@@ -181,7 +192,7 @@ ON CONFLICT (user_id, provider_type, grant_reason) DO NOTHING`,
 //
 // The work rechecks enforced domain policy and normalized-email availability
 // in its operation context before account creation and invitation use. A
-// configured Ent client opens an owned transaction; database-free fixtures run
+// configured Ent client joins an injected transaction or opens its own; database-free fixtures run
 // the supplied repositories directly. Domain quota requires the atomic
 // repository capability when a database is configured, while its absent
 // fixture capability uses ordinary creation. Repository writes can mutate the
@@ -262,7 +273,7 @@ func (s *AuthState) AuthCreateRegisteredUser(ctx context.Context, user *identity
 		return nil
 	}
 
-	if s.entClient == nil {
+	if s.entClient == nil || dbent.TxFromContext(ctx) != nil {
 		return run(ctx)
 	}
 
@@ -378,9 +389,9 @@ func (s *AuthState) AuthEnsureEmailAuthIdentity(ctx context.Context, user *ident
 }
 
 // AuthEnsureEmailOAuthIdentity creates or refreshes one provider tuple for the
-// supplied account through the configured Ent client. Callers provide a
-// validated provider profile and a client participating in any required
-// transaction; this method uses that client directly.
+// supplied account through a joined or owned Ent transaction. The current user
+// row remains locked on PostgreSQL through provider persistence, preventing an older legacy
+// callback from writing a provider binding after central ownership activation.
 //
 // The type is normalized while key and subject are trimmed before ownership
 // lookup. A same-owner row receives replacement metadata, and another owner
@@ -389,6 +400,24 @@ func (s *AuthState) AuthEnsureEmailAuthIdentity(ctx context.Context, user *ident
 // name and avatar hints are applied. New rows receive those selected values
 // and the requested account ID.
 func (s *AuthState) AuthEnsureEmailOAuthIdentity(ctx context.Context, userID int64, input identitycore.EmailOAuthIdentityInput) error {
+	if s == nil || s.entClient == nil {
+		return identitycore.ErrServiceUnavailable
+	}
+	if dbent.TxFromContext(ctx) == nil {
+		tx, err := s.entClient.Tx(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := s.AuthEnsureEmailOAuthIdentity(dbent.NewTxContext(ctx, tx), userID, input); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	client := dbent.TxFromContext(ctx).Client()
+	if err := requireLegacyAuthUser(ctx, client, userID); err != nil {
+		return err
+	}
 	metadata := map[string]any{
 		"email":          strings.TrimSpace(strings.ToLower(input.Email)),
 		"email_verified": input.EmailVerified,
@@ -407,7 +436,7 @@ func (s *AuthState) AuthEnsureEmailOAuthIdentity(ctx context.Context, userID int
 	providerType := identitycore.AuthNormalizeOAuthSignupSource(input.ProviderType)
 	providerKey := strings.TrimSpace(input.ProviderKey)
 	providerSubject := strings.TrimSpace(input.ProviderSubject)
-	identity, err := s.entClient.AuthIdentity.Query().
+	identity, err := client.AuthIdentity.Query().
 		Where(
 			authidentity.ProviderTypeEQ(providerType),
 			authidentity.ProviderKeyEQ(providerKey),
@@ -421,12 +450,12 @@ func (s *AuthState) AuthEnsureEmailOAuthIdentity(ctx context.Context, userID int
 		if identity.UserID != userID {
 			return infraerrors.Conflict("AUTH_IDENTITY_OWNERSHIP_CONFLICT", "auth identity already belongs to another user")
 		}
-		_, err = s.entClient.AuthIdentity.UpdateOneID(identity.ID).
+		_, err = client.AuthIdentity.UpdateOneID(identity.ID).
 			SetMetadata(metadata).
 			Save(ctx)
 		return err
 	}
-	_, err = s.entClient.AuthIdentity.Create().
+	_, err = client.AuthIdentity.Create().
 		SetUserID(userID).
 		SetProviderType(providerType).
 		SetProviderKey(providerKey).
@@ -434,6 +463,29 @@ func (s *AuthState) AuthEnsureEmailOAuthIdentity(ctx context.Context, userID int
 		SetMetadata(metadata).
 		Save(ctx)
 	return err
+}
+
+// requireLegacyAuthUser checks current ownership before legacy authentication
+// writes using the caller's transaction client. PostgreSQL retains its row lock
+// until that transaction finishes, serializing these writes with central
+// ownership activation. SQLite fixtures cannot express SELECT FOR UPDATE and
+// use their existing transaction isolation instead; they still reject a
+// central-managed owner and propagate every lookup error. This compatibility
+// path neither qualifies row-lock concurrency nor adds SQLite support to the
+// PostgreSQL-only central session store.
+func requireLegacyAuthUser(ctx context.Context, client *dbent.Client, userID int64) error {
+	query := client.User.Query().Where(dbuser.IDEQ(userID))
+	if client.Driver().Dialect() != dialect.SQLite {
+		query = query.ForUpdate()
+	}
+	current, err := query.Only(ctx)
+	if err != nil {
+		return err
+	}
+	if current.CentralManaged {
+		return identitycore.ErrCentralLoginRequired
+	}
+	return nil
 }
 
 // AuthFindEmailOAuthIdentityOwner resolves the exact supplied provider tuple

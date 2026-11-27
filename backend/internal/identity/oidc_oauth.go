@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"time"
 )
 
 // oidc_oauth.go builds OIDC compatibility identifiers and pending account
@@ -122,6 +123,17 @@ type OIDCVerifiedClaims struct {
 	// token. The callback decides whether it satisfies required-email or
 	// automatic-binding policy.
 	EmailVerified *bool
+	// IssuedAt and ExpiresAt are mandatory signed token bounds. AuthenticatedAt
+	// retains the separate optional flow timestamp; a missing authentication time
+	// cannot be replaced by issuance time when establishing recent proof.
+	IssuedAt        time.Time  // signed UTC issuance time
+	ExpiresAt       time.Time  // signed UTC expiration time
+	AuthenticatedAt *time.Time // optional UTC authentication time
+	// These fields retain signed provider observations. Familiar acr or amr
+	// labels alone do not establish a qualified independent-factor admission.
+	SessionID             string   // upstream provider session identifier
+	AuthenticationContext string   // provider authentication context label
+	AuthenticationMethods []string // provider authentication method labels
 }
 
 // OIDCOAuthClient exchanges credentials, extracts userinfo and validates

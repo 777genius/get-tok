@@ -13,7 +13,8 @@ import (
 	"github.com/TokenFlux/TokenRouter/internal/billing"
 )
 
-// Independent dashboard callbacks can use separate pool connections, while a
+// usage_log_repo_dashboard_test.go checks query scheduling and persisted report
+// scope. Independent callbacks can use separate pool connections, while a
 // selected nonpool executor follows a serial sequence. Atomic overlap markers
 // check the serial path, and a two-start channel gate checks pool dispatch
 // before either callback is released.
@@ -23,7 +24,8 @@ import (
 // runner so a failed concurrency assertion can finish its workers. The
 // owned-team SQL fixture then checks a different relationship: key, retained
 // usage, and recent-rate queries use disjoint actor/team branches and return
-// consistent scoped counters.
+// consistent scoped counters. The personal fixture requires stored team
+// exclusion without allowing a preliminary membership query.
 
 // TestRunDashboardQueriesSerializesNonPoolExecutor supplies callbacks that
 // record overlap on a store without a pool. It checks successful execution and
@@ -126,5 +128,33 @@ func TestGetUserDashboardStatsUsesIndexableOwnedTeamScope(t *testing.T) {
 	require.Equal(t, int64(36), stats.TotalTokens)
 	require.Equal(t, int64(2), stats.Rpm)
 	require.Equal(t, int64(20), stats.Tpm)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPersonalDashboardUsesPersistedScopeWithoutMembership requires team-null
+// predicates in key counts, retained usage and recent rates. No membership read
+// is expected, so a preliminary team lookup cannot decide the report's scope.
+func TestPersonalDashboardUsesPersistedScopeWithoutMembership(t *testing.T) {
+	db, mock := newSQLMock(t)
+	mock.MatchExpectationsInOrder(false)
+	repo := &Store{sql: db}
+	mock.ExpectQuery("(?s)WITH scoped AS.*FROM api_keys.*user_id = \\$1 AND team_id IS NULL.*COUNT\\(\\*\\) FILTER").
+		WithArgs(int64(7), int64(0), billing.StatusActive).
+		WillReturnRows(sqlmock.NewRows([]string{"total", "active"}).AddRow(int64(1), int64(1)))
+	mock.ExpectQuery("(?s)WITH scoped AS.*FROM usage_logs WHERE user_id = \\$1 AND team_id IS NULL.*COUNT\\(\\*\\) FILTER").
+		WithArgs(int64(7), int64(0), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"requests", "input", "output", "creation", "read", "cost", "actual", "duration", "observed",
+			"today_requests", "today_input", "today_output", "today_creation", "today_read", "today_cost", "today_actual",
+		}).AddRow(1, 10, 20, 0, 0, 0.1, 0.1, 100, 1, 1, 10, 20, 0, 0, 0.1, 0.1))
+	mock.ExpectQuery("(?s)WITH scoped AS.*user_id = \\$1 AND created_at >= \\$3 AND team_id IS NULL.*UNION ALL.*created_at >= \\$3 AND team_id IS NULL").
+		WithArgs(int64(7), int64(0), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"requests", "tokens"}).AddRow(1, 30))
+	stats, err := repo.GetPersonalDashboardStats(context.Background(), 7)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), stats.TotalAPIKeys)
+	require.Equal(t, int64(1), stats.TotalRequests)
+	require.Equal(t, int64(30), stats.TotalTokens)
+	require.Equal(t, int64(6), stats.Tpm)
 	require.NoError(t, mock.ExpectationsWereMet())
 }

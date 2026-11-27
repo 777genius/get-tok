@@ -83,6 +83,7 @@ var (
 	// auditBodyOmittedRoutes lists routes with opaque uploads or credentials whose field names are chosen dynamically.
 	// Key-based redaction cannot safely inspect these values, so the entire body is omitted.
 	auditBodyOmittedRoutes = map[string]struct{}{
+		"POST /api/v1/auth/central/start":                            {},
 		"PUT /api/v1/admin/plugins/:id/config":                       {},
 		"POST /api/v1/admin/plugins/uploads":                         {},
 		"POST /api/v1/admin/mcp/oauth/requests/:id/decision":         {},

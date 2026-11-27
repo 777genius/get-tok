@@ -11,6 +11,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// ops_ws_handler_test.go verifies administrator WebSocket helpers and protocol
+// negotiation through local sockets. The cases preserve current and legacy
+// brand compatibility while confirming that authentication protocol inputs are
+// never reflected as selected branding.
+
 // TestOpsWSHelpers mixes one valid network prefix with invalid text, strips a
 // normal host port, and checks matching addresses. It protects those supplied
 // helper cases without asserting complete proxy or Origin policy behavior.
@@ -27,13 +32,13 @@ func TestOpsWSHelpers(t *testing.T) {
 	require.False(t, isAddrInTrustedProxies(netip.MustParseAddr("192.168.0.1"), prefixes))
 }
 
-// TestOpsWSBrandNegotiation offers legacy, current, and mixed administrator
-// subprotocol names to a local upgrade server. It checks legacy compatibility
-// and current-name preference; jwt.fixture is not echoed, and this fixture
-// performs no JWT validation.
+// TestOpsWSBrandNegotiation offers legacy, current, mixed, and unsupported
+// administrator subprotocol names to a local upgrade server. It checks legacy
+// compatibility and current-name preference in both client orders; jwt.fixture
+// is not echoed, and this fixture performs no JWT validation.
 func TestOpsWSBrandNegotiation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
+		conn, err := upgradeOpsWS(w, r, nil)
 		if err != nil {
 			return
 		}
@@ -45,21 +50,23 @@ func TestOpsWSBrandNegotiation(t *testing.T) {
 	// each upgraded socket separately, and client cases close their returned
 	// connections.
 	defer server.Close()
-	for _, protocols := range [][]string{
-		{"sub2api-admin", "jwt.fixture"},
-		{"tokenrouter-admin", "jwt.fixture"},
-		{"sub2api-admin", "tokenrouter-admin", "jwt.fixture"},
+	for _, tc := range []struct {
+		protocols []string // client-offered protocol order
+		want      string   // selected administrator brand
+	}{
+		{[]string{"sub2api-admin", "jwt.fixture"}, "sub2api-admin"},
+		{[]string{"tokenrouter-admin", "jwt.fixture"}, "tokenrouter-admin"},
+		{[]string{"sub2api-admin", "tokenrouter-admin", "jwt.fixture"}, "tokenrouter-admin"},
+		{[]string{"tokenrouter-admin", "sub2api-admin", "jwt.fixture"}, "tokenrouter-admin"},
+		{[]string{"jwt.fixture"}, ""},
+		{nil, ""},
 	} {
-		dialer := websocket.Dialer{Subprotocols: protocols}
+		dialer := websocket.Dialer{Subprotocols: tc.protocols}
 		// Open each case through a real local handshake to observe Gorilla's selected
 		// response subprotocol, then close the resulting connection.
 		conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
 		require.NoError(t, err)
-		want := "tokenrouter-admin"
-		if len(protocols) == 2 && protocols[0] == "sub2api-admin" {
-			want = "sub2api-admin"
-		}
-		require.Equal(t, want, conn.Subprotocol())
+		require.Equal(t, tc.want, conn.Subprotocol())
 		require.NoError(t, conn.Close())
 	}
 }

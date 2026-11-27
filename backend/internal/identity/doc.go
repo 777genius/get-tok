@@ -28,6 +28,8 @@
 //     participation.
 //   - session_*.go, refresh_token_cache.go, and clock.go define credential
 //     lifecycle, request binding, cache operations, and clock observations.
+//   - central_*.go defines shared-identity authority ports, immutable admission
+//     evidence, bounded status observations, and monotone revocation decisions.
 //   - pending*.go and oauth_*.go describe browser state, account choice,
 //     provider subjects, and profile-adoption rules.
 //   - dingtalk_*.go, wechat_oauth.go, linuxdo_oauth.go, oidc_oauth.go, and

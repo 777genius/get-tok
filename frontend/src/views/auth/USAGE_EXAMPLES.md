@@ -544,13 +544,15 @@ import LoginView from '@/views/auth/LoginView.vue'; // ❌ Eager loaded
 ### Issue: Token not persisting after refresh
 
 ```typescript
-// Solution: Initialize auth state on app mount
-// In main.ts or App.vue
-import { useAuthStore } from '@/stores'
-
-const authStore = useAuthStore()
-authStore.checkAuth() // Restore auth from localStorage
+// The installed route guard awaits initializeSession() before checking access.
+// In main.ts, mount only after that navigation has completed.
+await router.isReady()
+app.mount('#app')
 ```
+
+Session restoration checks the central cookie before allowing legacy storage fallback.
+Keep that decision in the route guard; a component mount must not restore legacy
+credentials after a central service failure.
 
 ### Issue: Redirect loop after login
 

@@ -1,5 +1,10 @@
 import { reactive } from 'vue'
 import { buildApiUrl } from '@/api/client'
+import {
+  authenticationHeaders,
+  authenticationEpoch,
+  assertAuthenticationEpoch,
+} from '@/api/authenticationContext'
 import { ADMIN_UI_REQUEST_HEADER } from '@/api/adminUIRequest'
 import type {
   SystemOneTestPayload,
@@ -18,8 +23,9 @@ import type { ProviderTestProtocol } from './providerTestProtocols'
  * The first terminal event decides success or failure so a trailing completion cannot replace
  * an earlier error. Streaming decoding carries incomplete text lines between reads and handles
  * newline-terminated data records individually. AbortError returns the run to idle and reports
- * cancellation to the batch scheduler; other transport failures become visible errors. Callers
- * own cancellation and must coordinate reuse of a run.
+ * cancellation to the batch scheduler; other transport failures become visible errors. A changed
+ * authentication generation cancels the received body before reporting its rejected result.
+ * Callers own ordinary cancellation and must coordinate reuse of a run.
  */
 
 /**
@@ -179,7 +185,8 @@ export function resetProviderTestRun(run: ProviderTestRun) {
  * still append output. A decision request copies questions and images before dispatch so later
  * form edits do not relabel its answers. The decoder retains incomplete newline-delimited records between
  * reads; an unterminated final record is not dispatched. AbortError resets status to idle and
- * leaves collected output available.
+ * leaves collected output available. A response or stream read from a superseded authentication
+ * generation is cancelled before its epoch error reaches the normal failure handler.
  */
 export async function executeProviderTest(options: {
   providerId: number // provider endpoint record identifier
@@ -312,17 +319,27 @@ export async function executeProviderTest(options: {
         Object.values(decision.questions).some((question) => question.type === 'box'))
     // Choosing images or Box in this administrator form explicitly opts this test into the
     // experimental upstream feature. Private image names and associations never leave the browser.
+    const expectedSession = authenticationEpoch()
     const response = await fetch(buildApiUrl(`/admin/providers/${options.providerId}/test`), {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${localStorage.getItem('auth_token')}`,
+        ...authenticationHeaders(),
         'Content-Type': 'application/json',
         [ADMIN_UI_REQUEST_HEADER]: '1',
         ...(usesImages ? { 'TypeSafe-Danger-Zone-Images': 'true' } : {}),
       },
       body: JSON.stringify(requestBody),
       signal: options.signal,
+      credentials: 'include',
     })
+    try {
+      assertAuthenticationEpoch(expectedSession)
+    } catch (error) {
+      // The old session no longer owns this response. Cancel its unopened body before
+      // reporting the epoch error, preserving that error if transport cleanup also fails.
+      await response.body?.cancel().catch(() => {})
+      throw error
+    }
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`)
     }
@@ -335,6 +352,14 @@ export async function executeProviderTest(options: {
     let buffer = ''
     while (true) {
       const { done, value } = await reader.read()
+      try {
+        assertAuthenticationEpoch(expectedSession)
+      } catch (error) {
+        // A replacement session cannot consume this stream. Release its locked reader
+        // before reporting the epoch error, even when transport cancellation itself rejects.
+        await reader.cancel().catch(() => {})
+        throw error
+      }
       if (done) break
 
       // Retain decoder state and the unfinished line between reads so split UTF-8 bytes and

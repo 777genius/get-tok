@@ -19,6 +19,76 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestLoadCentralIdentityRequiresPersistentEncryption loads the real environment
+// configuration. Production-form central authentication requires a configured
+// key before retaining browser transactions across replicas or process restarts.
+func TestLoadCentralIdentityRequiresPersistentEncryption(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	for name, value := range map[string]string{
+		"CENTRAL_IDENTITY_ENABLED":                "true",
+		"CENTRAL_IDENTITY_ORIGIN":                 "https://gettok.example.invalid",
+		"CENTRAL_IDENTITY_API_URL":                "https://identity.example.invalid",
+		"CENTRAL_IDENTITY_ISSUER_URL":             "https://accounts.example.invalid/realms/identity",
+		"CENTRAL_IDENTITY_AUTHORITY_INCARNATION":  "authority-test",
+		"CENTRAL_IDENTITY_CLIENT_ID":              "human-test",
+		"CENTRAL_IDENTITY_CLIENT_SECRET":          "synthetic-human-secret",
+		"CENTRAL_IDENTITY_WORKLOAD_CLIENT_ID":     "workload-test",
+		"CENTRAL_IDENTITY_WORKLOAD_CLIENT_SECRET": "synthetic-workload-secret",
+		"TOTP_ENCRYPTION_KEY":                     "",
+	} {
+		t.Setenv(name, value)
+	}
+	_, err := Load()
+	require.ErrorContains(t, err, "central_identity requires a configured persistent")
+	t.Setenv("TOTP_ENCRYPTION_KEY", strings.Repeat("a", 64))
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.True(t, cfg.CentralIdentity.Enabled)
+	require.True(t, cfg.Totp.EncryptionKeyConfigured)
+	// Browser serialization removes default ports and numeric padding. Startup
+	// rejects those inputs while preserving ordinary and non-default TEST origins.
+	for _, row := range []struct {
+		origin  string // supplied browser-facing origin with otherwise valid inputs
+		allowed bool   // startup accepts the browser's canonical port representation
+	}{
+		{"https://gettok.example.invalid", true},
+		{"https://gettok.example.invalid:443", false},
+		{"https://gettok.example.invalid:0443", false},
+		{"https://gettok.example.invalid:8443", true},
+		{"https://gettok.example.invalid:08443", false},
+		{"https://gettok.example.invalid:65536", false},
+		{"http://127.0.0.1", true},
+		{"http://127.0.0.1:", false},
+		{"http://127.0.0.1:80", false},
+		{"http://127.0.0.1:0080", false},
+		{"http://127.0.0.1:18182", true},
+		{"http://[::1]:80", false},
+		{"http://[::1]:18182", true},
+	} {
+		t.Run(row.origin, func(t *testing.T) {
+			candidate := cfg.CentralIdentity
+			candidate.Origin = row.origin
+			if strings.HasPrefix(row.origin, "http:") {
+				candidate.TestLoopback = true
+				candidate.APIURL = "http://127.0.0.1:18183"
+				candidate.IssuerURL = "http://127.0.0.1:18184/realms/identity"
+			}
+			err := candidate.Validate()
+			if row.allowed {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "central_identity.origin")
+			}
+		})
+	}
+	cfg.CentralIdentity.APIURL += "?"
+	require.Error(t, cfg.CentralIdentity.Validate())
+	cfg.CentralIdentity.APIURL = "http://127.0.0.1:18183"
+	require.Error(t, cfg.CentralIdentity.Validate())
+	cfg.CentralIdentity.TestLoopback = true
+	require.Error(t, cfg.CentralIdentity.Validate(), "TEST mode cannot retain remote identity endpoints")
+}
+
 // TestLoadDefaultModelsListReadMaxBytes loads configuration with the standard
 // fixture JWT secret. The model-list body limit must equal the named default
 // used for upstream model responses.

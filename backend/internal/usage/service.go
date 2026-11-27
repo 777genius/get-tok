@@ -16,11 +16,20 @@ import (
 // summaries after gateway completion writes them. Query methods use the
 // injected repository, while optional readers carry richer filter shapes and
 // model dimensions for implementations that support them; access control
-// remains with each HTTP or module caller.
+// remains with each HTTP or module caller. An explicitly personal query keeps
+// its team exclusion through the selected capability; a missing capability
+// returns a scope-unavailable error before any broader query is attempted.
 
-// ErrUsageLogNotFound identifies an absent usage row for repository and HTTP
-// callers, allowing the standard application-error mapper to return not found.
-var ErrUsageLogNotFound = infraerrors.NotFound("USAGE_LOG_NOT_FOUND", "usage log not found")
+// Usage query errors distinguish missing records from unsupported resource
+// scopes for repository, service and HTTP callers.
+var (
+	// ErrUsageLogNotFound identifies an absent usage row for repository and HTTP
+	// callers, allowing the standard application-error mapper to return not found.
+	ErrUsageLogNotFound = infraerrors.NotFound("USAGE_LOG_NOT_FOUND", "usage log not found")
+	// ErrUsageScopeUnsupported prevents a reduced query signature from silently
+	// discarding the persisted resource restriction required by its caller.
+	ErrUsageScopeUnsupported = infraerrors.ServiceUnavailable("USAGE_SCOPE_UNAVAILABLE", "The requested usage scope is unavailable")
+)
 
 // UsageService exposes recorded usage queries through persistence and optional
 // filter readers.
@@ -119,6 +128,22 @@ func (s *UsageService) GetUserDashboardStats(ctx context.Context, userID int64) 
 	return stats, nil
 }
 
+// GetPersonalDashboardStats returns counters for the user's personal resources only.
+// It requires a repository capability that excludes persisted team attribution
+// from keys and usage. An unavailable capability returns an error without calling
+// the broader legacy dashboard, even when the user currently owns no team.
+func (s *UsageService) GetPersonalDashboardStats(ctx context.Context, userID int64) (*UserDashboardStats, error) {
+	reader := s.readers.PersonalDashboardReader
+	if reader == nil {
+		return nil, ErrUsageScopeUnsupported
+	}
+	stats, err := reader.GetPersonalDashboardStats(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("get personal dashboard stats: %w", err)
+	}
+	return stats, nil
+}
+
 // GetAPIKeyDashboardStats returns a key's retained totals and today's values,
 // including future-dated records. PostgreSQL computes recent RPM and TPM from
 // raw records and averages observed durations; callers authenticate the key
@@ -147,6 +172,7 @@ func (s *UsageService) GetUserUsageTrendByUserID(ctx context.Context, userID int
 // ProviderID, GroupID, Model, RequestType, Stream, and BillingType; callers
 // requiring additional selectors choose a reader with those filtering rules.
 // UsageTrendWithFiltersRepo documents PostgreSQL's legacy request-ID limitation.
+// Personal-only queries require the unified reader and never use the scalar fallback.
 func (s *UsageService) GetUsageTrendWithFilters(ctx context.Context, startTime, endTime time.Time, granularity string, filters UsageLogFilters) ([]TrendDataPoint, error) {
 	if filterRepo := s.readers.UsageTrendWithFiltersRepo; filterRepo != nil {
 		trend, err := filterRepo.GetUsageTrendWithUsageFilters(ctx, startTime, endTime, granularity, filters)
@@ -154,6 +180,9 @@ func (s *UsageService) GetUsageTrendWithFilters(ctx context.Context, startTime, 
 			return nil, fmt.Errorf("get usage trend with filters: %w", err)
 		}
 		return trend, nil
+	}
+	if filters.PersonalOnly {
+		return nil, ErrUsageScopeUnsupported
 	}
 	// The base signature cannot carry team or request-ID selectors. Use the
 	// selected enhanced capability above when those restrictions are required by callers.
@@ -181,6 +210,7 @@ func (s *UsageService) GetUserModelStats(ctx context.Context, userID int64, star
 // UserID, APIKeyID, ProviderID, GroupID, RequestType, Stream, and BillingType;
 // model-text, team, request-ID, and other unified restrictions require the first
 // reader capability.
+// Personal-only queries fail closed when that capability is unavailable.
 func (s *UsageService) GetModelStatsWithFiltersBySource(ctx context.Context, startTime, endTime time.Time, filters UsageLogFilters, modelSource string) ([]ModelStat, error) {
 	normalizedSource := NormalizeModelSource(modelSource)
 
@@ -192,6 +222,9 @@ func (s *UsageService) GetModelStatsWithFiltersBySource(ctx context.Context, sta
 		return stats, nil
 	}
 
+	if filters.PersonalOnly {
+		return nil, ErrUsageScopeUnsupported
+	}
 	if sourceRepo := s.readers.ModelStatsBySourceRepo; sourceRepo != nil {
 		stats, err := sourceRepo.GetModelStatsWithFiltersBySource(ctx, startTime, endTime, filters.UserID, filters.APIKeyID, filters.ProviderID, filters.GroupID, filters.RequestType, filters.Stream, filters.BillingType, normalizedSource)
 		if err != nil {
@@ -212,6 +245,9 @@ func (s *UsageService) GetModelStatsWithFiltersBySource(ctx context.Context, sta
 // when one is supplied. The base path forwards UserID, APIKeyID, ProviderID,
 // GroupID, RequestType, Stream, and BillingType, so callers needing additional
 // restrictions supply the enhanced reader.
+// A personal-only request fails closed before the scalar fallback because that
+// signature cannot preserve stored team exclusion. Other selectors retain their
+// existing reduced-reader behavior and callers choose the appropriate capability.
 func (s *UsageService) GetGroupStatsWithFilters(ctx context.Context, startTime, endTime time.Time, filters UsageLogFilters) ([]GroupStat, error) {
 	if filterRepo := s.readers.GroupStatsWithUsageFiltersRepo; filterRepo != nil {
 		stats, err := filterRepo.GetGroupStatsWithUsageFilters(ctx, startTime, endTime, filters)
@@ -219,6 +255,9 @@ func (s *UsageService) GetGroupStatsWithFilters(ctx context.Context, startTime, 
 			return nil, fmt.Errorf("get group stats with filters: %w", err)
 		}
 		return stats, nil
+	}
+	if filters.PersonalOnly {
+		return nil, ErrUsageScopeUnsupported
 	}
 	// The base group query carries its scalar selectors. Team, personal, owned-team,
 	// and request-ID restrictions need the unified-filter capability selected above.

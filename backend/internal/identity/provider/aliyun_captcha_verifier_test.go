@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -20,6 +21,10 @@ func newAliyunCaptchaTestTarget(t *testing.T, handler http.HandlerFunc) (*aliyun
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
+	// The SDK compares NO_PROXY entries with the complete endpoint, including its
+	// ephemeral port. Exclude this fixture listener so inherited proxy settings
+	// cannot send the local verification request to an unrelated network service.
+	t.Setenv("NO_PROXY", os.Getenv("NO_PROXY")+","+server.Listener.Addr().String())
 
 	verifier := &aliyunCaptchaVerifier{protocol: "HTTP", timeoutMillis: 2_000}
 	cred := identity.AliyunCaptchaCredentials{
@@ -96,6 +101,9 @@ func TestAliyunCaptchaVerifier_APIErrorNormalized(t *testing.T) {
 func TestAliyunCaptchaVerifier_TransportError(t *testing.T) {
 	server := httptest.NewServer(http.NotFoundHandler())
 	endpoint := strings.TrimPrefix(server.URL, "http://")
+	// The SDK matches complete endpoint names, including ports. Keep this
+	// closed fixture off inherited proxies so refusal remains a local transport error.
+	t.Setenv("NO_PROXY", os.Getenv("NO_PROXY")+","+endpoint)
 	// Close the fixture listener before verification so the request fails during
 	// transport setup and never obtains a provider JSON error response.
 	server.Close()

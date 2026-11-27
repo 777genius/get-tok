@@ -602,6 +602,11 @@ func ApplyPendingOAuthBindingTx(
 		}
 		targetUserID = resolvedUserID
 	}
+	// Serialize legacy provider adoption with central ownership activation. A
+	// preflight JWT or password check cannot authorize writes after that commit.
+	if err := requireLegacyAuthUser(ctx, tx.Client(), targetUserID); err != nil {
+		return err
+	}
 
 	adoptedDisplayName := ""
 	if decision != nil && decision.AdoptDisplayName {

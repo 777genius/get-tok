@@ -6,6 +6,13 @@ import RegisterView from '@/views/auth/RegisterView.vue'
 // validation, and email-domain admission. Mounted forms use controlled endpoint
 // responses so the assertions distinguish local rejection from backend quota
 // enforcement and detect duplicate validation toasts.
+//
+// Central registration performs its required-invitation preflight before asking
+// an action captcha provider for proof. The provider button remains an explicit
+// user action, and a nonempty trimmed invitation still travels to the backend
+// for authoritative validation. Observable captcha and start-endpoint fixtures
+// distinguish local refusal from consuming a proof, so the regression cannot
+// pass merely because the provider request failed later in the flow.
 
 // These fixtures provide controllable dependencies and component handles for the
 // cases below. Each test configures the responses it needs and inspects calls or
@@ -19,6 +26,8 @@ const {
   validatePromoCodeMock,
   validateInvitationCodeMock,
   formatBalanceAmountMock,
+  centralStartMock,
+  verifyActionMock,
   routeState,
 } = vi.hoisted(() => ({
   pushMock: vi.fn(),
@@ -29,6 +38,8 @@ const {
   validatePromoCodeMock: vi.fn(),
   validateInvitationCodeMock: vi.fn(),
   formatBalanceAmountMock: vi.fn(),
+  centralStartMock: vi.fn(),
+  verifyActionMock: vi.fn(),
   routeState: {
     query: {} as Record<string, unknown>,
   },
@@ -92,6 +103,10 @@ vi.mock('@/api/auth', async () => {
   }
 })
 
+vi.mock('@/api/centralAuth', () => ({
+  centralAuthAPI: { start: centralStartMock },
+}))
+
 vi.mock('@/composables/useBalanceDisplay', () => ({
   // useBalanceDisplay supplies the promotion-bonus formatter used by the
   // registration page.
@@ -138,7 +153,11 @@ async function mountView() {
         LinuxDoOAuthSection: true,
         WechatOAuthSection: true,
         OidcOAuthSection: true,
-        TurnstileWidget: true,
+        CentralSignInSection: true,
+        TurnstileWidget: {
+          template: '<div />',
+          methods: { verifyAction: verifyActionMock, reset: vi.fn() },
+        },
         Icon: true,
         RouterLink: { template: '<a><slot /></a>' },
         transition: false,
@@ -185,6 +204,8 @@ describe('RegisterView', () => {
       oidc_oauth_provider_name: 'OIDC',
       registration_email_suffix_whitelist: [],
     })
+    centralStartMock.mockReset()
+    verifyActionMock.mockReset()
     validatePromoCodeMock.mockReset()
     validateInvitationCodeMock.mockReset()
     formatBalanceAmountMock
@@ -200,6 +221,43 @@ describe('RegisterView', () => {
   afterEach(() => {
     vi.useRealTimers()
   })
+
+  // A central signup needs its required invitation before consuming an action captcha proof.
+  // A later nonblank value still reaches the backend as a trimmed invitation.
+  it.each(['', '   '])(
+    'requires a trimmed central invitation before captcha or provider start',
+    async (invitation) => {
+      getPublicSettingsMock.mockResolvedValueOnce({
+        registration_enabled: true,
+        invitation_code_enabled: true,
+        tencent_captcha_enabled: true,
+        tencent_captcha_app_id: 'test-only',
+      })
+      verifyActionMock.mockResolvedValue({ token: 'captcha-proof', randstr: 'captcha-random' })
+      centralStartMock.mockRejectedValue(new Error('Test endpoint unavailable'))
+      const wrapper = await mountView()
+      await wrapper.get('#invitation_code').setValue(invitation)
+      const provider = wrapper.getComponent({ name: 'CentralSignInSection' })
+      provider.vm.$emit('start', 'github')
+      await flushPromises()
+      expect(showErrorMock).toHaveBeenCalledWith('auth.invitationCodeRequired')
+      expect(verifyActionMock).not.toHaveBeenCalled()
+      expect(centralStartMock).not.toHaveBeenCalled()
+
+      await wrapper.get('#invitation_code').setValue(' INVITE123 ')
+      provider.vm.$emit('start', 'github')
+      await flushPromises()
+      expect(verifyActionMock).toHaveBeenCalledOnce()
+      expect(centralStartMock).toHaveBeenCalledExactlyOnceWith({
+        intent: 'register',
+        provider: 'github',
+        invitation_code: 'INVITE123',
+        tencent_captcha_ticket: 'captcha-proof',
+        tencent_captcha_randstr: 'captcha-random',
+      })
+      wrapper.unmount()
+    },
+  )
 
   // Public settings enable optional referral attribution without mandatory
   // invitations. The registration page must label that field optional and place it

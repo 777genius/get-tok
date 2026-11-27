@@ -171,6 +171,26 @@ export default {
   },
   // Auth
   auth: {
+    central: {
+      logoutFailed: 'Sign-out could not be confirmed. Please try again.',
+      signIn: 'Sign in with {provider}',
+      register: 'Create an account with {provider}',
+      defaultProvider: 'your shared account',
+      callbackTitle: 'Completing sign-in',
+      completing: 'Checking your account and session…',
+      unavailable: 'Shared account sign-in is temporarily unavailable.',
+      retry: 'Try again',
+      returnToLogin: 'Return to sign-in',
+      errors: {
+        account_not_linked:
+          'No GetTok account is linked to this identity. Create a new account, or sign in using your existing method. Existing accounts are not linked automatically.',
+        account_conflict:
+          'An existing account needs verified ownership before linking. Sign in using your existing method to keep access to that account.',
+        temporarily_unavailable: 'Sign-in is temporarily unavailable. Please try again.',
+        access_denied: 'Sign-in was cancelled or access was denied.',
+        authentication_failed: 'Sign-in could not be completed. Start a new sign-in attempt.',
+      },
+    },
     welcomeBack: 'Welcome Back',
     signInToAccount: 'Sign in to your account to continue',
     signIn: 'Sign In',

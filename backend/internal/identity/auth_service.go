@@ -31,12 +31,13 @@ import (
 // challenge failures for HTTP callers while preserving the shared identities
 // used by wrapped-error checks.
 var (
-	ErrInvalidCredentials = infraerrors.Unauthorized("INVALID_CREDENTIALS", "invalid email or password")
-	ErrUserNotActive      = infraerrors.Forbidden("USER_NOT_ACTIVE", "user is not active")
-	ErrEmailExists        = infraerrors.Conflict("EMAIL_EXISTS", "email already exists")
-	ErrEmailReserved      = infraerrors.BadRequest("EMAIL_RESERVED", "email is reserved")
-	ErrInvalidToken       = infraerrors.Unauthorized("INVALID_TOKEN", "invalid token")
-	ErrTokenExpired       = infraerrors.Unauthorized("TOKEN_EXPIRED", "token has expired")
+	ErrInvalidCredentials   = infraerrors.Unauthorized("INVALID_CREDENTIALS", "invalid email or password")
+	ErrUserNotActive        = infraerrors.Forbidden("USER_NOT_ACTIVE", "user is not active")
+	ErrEmailExists          = infraerrors.Conflict("EMAIL_EXISTS", "email already exists")
+	ErrEmailReserved        = infraerrors.BadRequest("EMAIL_RESERVED", "email is reserved")
+	ErrInvalidToken         = infraerrors.Unauthorized("INVALID_TOKEN", "invalid token")
+	ErrTokenExpired         = infraerrors.Unauthorized("TOKEN_EXPIRED", "token has expired")
+	ErrCentralLoginRequired = infraerrors.Forbidden("CENTRAL_LOGIN_REQUIRED", "this account requires central sign-in")
 
 	ErrTokenTooLarge       = infraerrors.BadRequest("TOKEN_TOO_LARGE", "token too large")
 	ErrTokenRevoked        = infraerrors.Unauthorized("TOKEN_REVOKED", "token has been revoked")
@@ -698,6 +699,9 @@ func (s *AuthService) AuthLoginOrRegisterOAuthWithTokenPair(ctx context.Context,
 	if !user.IsActive() {
 		return nil, nil, ErrUserNotActive
 	}
+	if user.CentralManaged {
+		return nil, nil, ErrCentralLoginRequired
+	}
 
 	if user.Username == "" && username != "" {
 		user.Username = username
@@ -808,7 +812,7 @@ func (s *AuthService) AuthResolveRegistrationArtifacts(ctx context.Context, invi
 		}
 		redeemCode, err := s.Redeem.GetByCode(ctx, invitationCode)
 		if err != nil {
-			s.Observer.Printf("service.auth", "[Auth] Invalid invitation code: %s, error: %v", invitationCode, err)
+			s.Observer.Printf("service.auth", "[Auth] Invalid invitation code lookup")
 			return nil, ErrInvitationCodeInvalid
 		}
 		if redeemCode.Type != RedeemTypeInvitation || !redeemCode.CanUse() {

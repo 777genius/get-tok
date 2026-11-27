@@ -36,7 +36,7 @@ import (
 type httpRouteSecurity struct {
 	// JWT, Admin, Audit, StepUp, BackendAuth, and BackendUser are supplied
 	// once by router assembly. Each route family chooses the guards and their execution order.
-	// JWT: panel bearer authentication.
+	// JWT: central-cookie or legacy panel authentication.
 	// Admin: administrator access authentication.
 	// Audit: panel activity recording.
 	// StepUp: sensitive action verification.
@@ -96,6 +96,7 @@ func provideAuthRouteMount(eModelMarketplace *routinghttp.MarketplaceHandler,
 			return security.AuthLimiter.LimitWithOptions(key, n, window, servermiddleware.RateLimitOptions{FailureMode: servermiddleware.RateLimitFailClose})
 		}}
 		identityhttp.RegisterAuthenticationRoutes(v1, eAuth, ePasskey, guards, func(group *gin.RouterGroup) { paymenthttp.RegisterWeChatAuthRoutes(group, eAuth) })
+		identityhttp.RegisterCentralAuthenticationRoutes(v1, eAuth.Central, guards)
 		public := v1.Group("/settings")
 		public.Use(security.Panel.PublicIP())
 		sitehttp.RegisterPublicSettingsRoutes(public, ePublicSettings)

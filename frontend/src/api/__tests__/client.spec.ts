@@ -26,6 +26,7 @@ describe('API Client', () => {
 
   beforeEach(async () => {
     localStorage.clear()
+    sessionStorage.clear()
     window.history.replaceState({}, '', '/')
     Object.defineProperty(navigator, 'locks', {
       configurable: true,
@@ -725,5 +726,180 @@ describe('API Client', () => {
 
       await expect(apiClient.get('/test', { cancelToken: source.token })).rejects.toBeDefined()
     })
+  })
+  // Central sessions authenticate through a cookie and bind every request to its CSRF
+  // owner. Stored legacy tokens cannot leak into either reads or writes in that mode.
+  it('attaches central CSRF ownership to reads and writes without a bearer', async () => {
+    const context = await import('@/api/authenticationContext')
+    context.replaceAuthentication({ csrfToken: 'central-proof', expiresAt: Date.now() + 300_000 })
+    localStorage.setItem('auth_token', 'stale-legacy-token')
+    const adapter = vi.fn(async (config) => ({
+      config,
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      data: { code: 0, data: {} },
+    }))
+    apiClient.defaults.adapter = adapter
+    await apiClient.get('/auth/me')
+    await apiClient.post('/auth/central/logout')
+    for (const [config] of adapter.mock.calls) {
+      expect(config.headers.get('Authorization')).toBeUndefined()
+      expect(config.headers.get('X-CSRF-Token')).toBe('central-proof')
+    }
+  })
+
+  // A central unauthorized response belongs to cookie authority, even if old legacy
+  // refresh material exists. It must not replay the request with another credential kind.
+  it('never refreshes or cleans legacy credentials after central unauthorized access', async () => {
+    const context = await import('@/api/authenticationContext')
+    context.replaceAuthentication({ csrfToken: 'central-proof', expiresAt: Date.now() + 300_000 })
+    window.history.replaceState({}, '', '/login')
+    localStorage.setItem('auth_token', 'stale-legacy-token')
+    localStorage.setItem('refresh_token', 'stale-legacy-refresh')
+    const refresh = vi
+      .spyOn(axios, 'post')
+      .mockRejectedValue(new Error('Unexpected legacy refresh'))
+    apiClient.defaults.adapter = async (config) => {
+      throw {
+        config,
+        response: { status: 401, data: { code: 'UNAUTHENTICATED' }, headers: {} },
+      }
+    }
+    await expect(apiClient.get('/auth/me')).rejects.toMatchObject({ status: 401 })
+    expect(context.centralTransport()).toBeNull()
+    expect(refresh).not.toHaveBeenCalled()
+    expect(localStorage.getItem('auth_token')).toBe('stale-legacy-token')
+  })
+
+  // Ordinary central login excludes the legacy bearer, while an explicitly requested
+  // binding start retains the proof needed to identify the existing product account.
+  it('carries a legacy bearer only for an explicit central binding request', async () => {
+    localStorage.setItem('auth_token', 'legacy-owner-proof')
+    const adapter = vi.fn(async (config) => ({
+      config,
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      data: { code: 0, data: {} },
+    }))
+    apiClient.defaults.adapter = adapter
+    await apiClient.post('/auth/central/start', { intent: 'login' })
+    await apiClient.post('/auth/central/start', { intent: 'bind' }, {
+      allowLegacyIdentityBinding: true,
+    } as import('axios').AxiosRequestConfig & { allowLegacyIdentityBinding: true })
+    expect(adapter.mock.calls[0][0].headers.get('Authorization')).toBeUndefined()
+    expect(adapter.mock.calls[1][0].headers.get('Authorization')).toBe('Bearer legacy-owner-proof')
+  })
+
+  // A successful profile read can arrive after a different session has been adopted.
+  // Its HTTP success must not bypass the same generation fence used for failed requests.
+  it('rejects successful responses dispatched before a session replacement', async () => {
+    const context = await import('@/api/authenticationContext')
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    apiClient.defaults.adapter = async (config) => {
+      entered.resolve()
+      await release.promise
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: { code: 0, data: { id: 1 } },
+      }
+    }
+    const old = apiClient.get('/auth/me')
+    const rejected = expect(old).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' })
+    await entered.promise
+    context.replaceAuthentication({
+      csrfToken: 'replacement-proof',
+      expiresAt: Date.now() + 300_000,
+    })
+    release.resolve()
+    await rejected
+    expect(context.centralTransport()?.csrfToken).toBe('replacement-proof')
+  })
+
+  // A successful legacy refresh settles after the browser adopts a central session.
+  // The original mutation must reject without replaying under the replacement cookie.
+  it('does not replay a legacy mutation when refresh completes after session replacement', async () => {
+    const context = await import('@/api/authenticationContext')
+    const refreshModule = await import('@/api/tokenRefresh')
+    const entered = Promise.withResolvers<void>()
+    const release =
+      Promise.withResolvers<Awaited<ReturnType<typeof refreshModule.refreshAuthTokens>>>()
+    vi.spyOn(refreshModule, 'refreshAuthTokens').mockImplementation(() => {
+      entered.resolve()
+      return release.promise
+    })
+    localStorage.setItem('auth_token', 'legacy-access')
+    localStorage.setItem('refresh_token', 'legacy-refresh')
+    const adapter = vi.fn(async (config) => {
+      throw {
+        config,
+        response: { status: 401, data: { code: 'TOKEN_EXPIRED' }, headers: {} },
+      }
+    })
+    apiClient.defaults.adapter = adapter
+    const mutation = apiClient.post('/user', { username: 'old-session-change' })
+    const rejected = expect(mutation).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' })
+    await entered.promise
+    context.replaceAuthentication({
+      csrfToken: 'replacement-proof',
+      expiresAt: Date.now() + 300_000,
+    })
+    release.resolve({
+      access_token: 'refreshed-old-access',
+      refresh_token: 'refreshed-old-refresh',
+      expires_in: 3600,
+      token_type: 'Bearer',
+    })
+    await rejected
+    expect(adapter).toHaveBeenCalledTimes(1)
+    expect(context.centralTransport()?.csrfToken).toBe('replacement-proof')
+    expect(sessionStorage.getItem('auth_expired')).toBeNull()
+  })
+
+  // A session changes after refresh settles but before Axios redispatches the retry.
+  // The queued request must retain its original owner and never reach the adapter again.
+  it('checks the original owner when a refreshed retry reaches request interceptors', async () => {
+    const context = await import('@/api/authenticationContext')
+    const refreshModule = await import('@/api/tokenRefresh')
+    vi.spyOn(refreshModule, 'refreshAuthTokens').mockResolvedValue({
+      access_token: 'rotated-access',
+      refresh_token: 'rotated-refresh',
+      expires_in: 3600,
+      token_type: 'Bearer',
+    })
+    localStorage.setItem('auth_token', 'legacy-access')
+    localStorage.setItem('refresh_token', 'legacy-refresh')
+    const adapter = vi.fn(async (config) => {
+      throw {
+        config,
+        response: { status: 401, data: { code: 'TOKEN_EXPIRED' }, headers: {} },
+      }
+    })
+    apiClient.defaults.adapter = adapter
+    // Axios runs later request interceptors first. This barrier replaces the
+    // session precisely before the shared interceptor would dispatch the retry.
+    const barrier = apiClient.interceptors.request.use((config) => {
+      if ((config as typeof config & { _retry?: boolean })._retry) {
+        context.replaceAuthentication({
+          csrfToken: 'new-session-proof',
+          expiresAt: Date.now() + 300_000,
+        })
+      }
+      return config
+    })
+    try {
+      await expect(apiClient.post('/user', { username: 'earlier-change' })).rejects.toMatchObject({
+        code: 'AUTH_SESSION_CHANGED',
+      })
+      expect(adapter).toHaveBeenCalledTimes(1)
+      expect(context.centralTransport()?.csrfToken).toBe('new-session-proof')
+    } finally {
+      apiClient.interceptors.request.eject(barrier)
+    }
   })
 })

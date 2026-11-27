@@ -89,6 +89,20 @@ func (_c *UserCreate) SetPasswordHash(v string) *UserCreate {
 	return _c
 }
 
+// SetCentralManaged sets the "central_managed" field.
+func (_c *UserCreate) SetCentralManaged(v bool) *UserCreate {
+	_c.mutation.SetCentralManaged(v)
+	return _c
+}
+
+// SetNillableCentralManaged sets the "central_managed" field if the given value is not nil.
+func (_c *UserCreate) SetNillableCentralManaged(v *bool) *UserCreate {
+	if v != nil {
+		_c.SetCentralManaged(*v)
+	}
+	return _c
+}
+
 // SetRole sets the "role" field.
 func (_c *UserCreate) SetRole(v string) *UserCreate {
 	_c.mutation.SetRole(v)
@@ -659,6 +673,10 @@ func (_c *UserCreate) defaults() error {
 		v := user.DefaultUpdatedAt()
 		_c.mutation.SetUpdatedAt(v)
 	}
+	if _, ok := _c.mutation.CentralManaged(); !ok {
+		v := user.DefaultCentralManaged
+		_c.mutation.SetCentralManaged(v)
+	}
 	if _, ok := _c.mutation.Role(); !ok {
 		v := user.DefaultRole
 		_c.mutation.SetRole(v)
@@ -745,6 +763,9 @@ func (_c *UserCreate) check() error {
 		if err := user.PasswordHashValidator(v); err != nil {
 			return &ValidationError{Name: "password_hash", err: fmt.Errorf(`ent: validator failed for field "User.password_hash": %w`, err)}
 		}
+	}
+	if _, ok := _c.mutation.CentralManaged(); !ok {
+		return &ValidationError{Name: "central_managed", err: errors.New(`ent: missing required field "User.central_managed"`)}
 	}
 	if _, ok := _c.mutation.Role(); !ok {
 		return &ValidationError{Name: "role", err: errors.New(`ent: missing required field "User.role"`)}
@@ -867,6 +888,10 @@ func (_c *UserCreate) createSpec() (*User, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.PasswordHash(); ok {
 		_spec.SetField(user.FieldPasswordHash, field.TypeString, value)
 		_node.PasswordHash = value
+	}
+	if value, ok := _c.mutation.CentralManaged(); ok {
+		_spec.SetField(user.FieldCentralManaged, field.TypeBool, value)
+		_node.CentralManaged = value
 	}
 	if value, ok := _c.mutation.Role(); ok {
 		_spec.SetField(user.FieldRole, field.TypeString, value)
@@ -1650,6 +1675,9 @@ func (u *UserUpsertOne) UpdateNewValues() *UserUpsertOne {
 		if _, exists := u.create.mutation.CreatedAt(); exists {
 			s.SetIgnore(user.FieldCreatedAt)
 		}
+		if _, exists := u.create.mutation.CentralManaged(); exists {
+			s.SetIgnore(user.FieldCentralManaged)
+		}
 	}))
 	return u
 }
@@ -2307,6 +2335,9 @@ func (u *UserUpsertBulk) UpdateNewValues() *UserUpsertBulk {
 		for _, b := range u.create.builders {
 			if _, exists := b.mutation.CreatedAt(); exists {
 				s.SetIgnore(user.FieldCreatedAt)
+			}
+			if _, exists := b.mutation.CentralManaged(); exists {
+				s.SetIgnore(user.FieldCentralManaged)
 			}
 		}
 	}))

@@ -9,7 +9,7 @@ import type { Router } from 'vue-router'
 // authStore models an anonymous browser whose first protected navigation must
 // redirect to login after the router has initialized its CLI import session.
 const authStore = vi.hoisted(() => ({
-  checkAuth: vi.fn(), // Browser session restoration spy.
+  initializeSession: vi.fn(), // Awaitable browser session restoration spy.
   isAuthenticated: false, // Anonymous browser authentication status.
   isAdmin: false, // Anonymous browser administrator status.
   hasPendingAuthSession: false, // External authentication completion status.

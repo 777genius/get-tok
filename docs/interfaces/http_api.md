@@ -8,6 +8,7 @@
 - [路由族](#路由族)：URL 前缀、认证方式和负责的模块。
 - [支付管理恢复](#payment_admin_recovery)：订单强制过期和退款查单。
 - [身份登录接口](#身份登录接口)：修改 OAuth start、人机验证和 One Tap 时读取。
+- [共享身份浏览器接口](#shared_identity_browser)：修改 opaque cookie、CSRF、中央登录和回调时读取。
 - [创作台接口](#创作台接口)：修改工作区、任务和输出交付时读取。
 - [提供商管理接口](#提供商管理接口)：修改批量管理、测试、诊断和导入时读取。
 - [备份与维护接口](#备份与维护接口)：修改备份和系统操作时读取。
@@ -27,6 +28,31 @@
 - [产品名称兼容](#product_name_compatibility)：修改新旧导入标识、请求头和浏览器状态时读取。
 
 新增创作台路由时，先读[创作台](../domains/creative_studio.md)，核对生命周期、幂等和留存规则。
+
+<a id="shared_identity_browser"></a>
+## 共享身份浏览器接口
+
+共享身份由 `identity/httpapi.CentralHandler` 提供，app 组合既有用户服务、PostgreSQL store、OIDC transport 和版本固定的 Identity Connect client。以下路由使用现有面板 envelope。浏览器只能获得现有用户资料、opaque HttpOnly cookie 和独立的 CSRF proof；provider access、refresh、ID token 及 workload token 都留在服务端。
+
+| 方法与路径 | 输入或结果 | 边界 |
+| --- | --- | --- |
+| `GET /api/v1/auth/central/config` | `enabled`、`provider_name`、`providers`、`legacy_binding_enabled` | 只返回展示和能力信息 |
+| `POST /api/v1/auth/central/start` | `intent: login\|register\|bind`，可选 `provider`、`invitation_code` 和现有人机验证字段；返回 `authorization_url` | 精确 Origin/Host，未知字段拒绝；bind 才允许显式的旧 Bearer 加 TEST 密码/TOTP proof |
+| `GET /api/v1/auth/central/callback` | provider code、state 和 browser transaction cookie | 原子消费一次性事务；nonce、PKCE、issuer、主体和中央 admission 校验成功后才写 session cookie |
+| `GET /api/v1/auth/central/session` | `user`、`csrf_token`、RFC3339 `expires_at`、`auth_mode: central` | 读取当前中央状态；bootstrap 可不带 CSRF，已带的 CSRF 必须匹配 |
+| `POST /api/v1/auth/central/logout` | opaque cookie、`X-CSRF-Token` | 精确 Origin；在本地数据库撤销当前浏览器 session，不依赖 Keycloak 可用性 |
+
+回调只跳转到 `/auth/central/callback`。失败时 `error` 限于 `account_not_linked`、`account_conflict`、`temporarily_unavailable`、`access_denied`、`authentication_failed`；授权码和 token 不进入前端 callback query 或 fragment。`login` 不建号，`register` 不按相同邮箱接管旧账户，既有账户迁移见[身份领域](../domains/identity_and_tenancy.md#shared_identity_sessions)。
+
+生产 cookie 为 `__Host-gettok-central` 和 `__Host-gettok-central-login`，带 `Secure`、`HttpOnly`、`SameSite=Lax`、`Path=/` 且无 Domain。loopback TEST 使用不同名称 `gettok-central-test` 与 `gettok-central-login-test`。认证响应使用 `Cache-Control: no-store`。opaque session 与 legacy Bearer 同时出现时拒绝混合身份；只有数据库确认该 cookie 已撤销或过期后，显式的 legacy Bearer 才能进入既有校验，已中央管理的用户仍会被拒绝。
+
+公开的 `POST /api/v1/auth/logout` 保留旧的可选 `refresh_token` payload，不要求 access token。浏览器仍带有 central cookie 时，只有数据库确认该 session 已撤销或过期，才交给旧 handler 撤销 refresh token；活动 session、未知 cookie 和数据库读取失败继续走 central proof 检查，不进入旧凭据撤销路径。这个选择不授予账户访问权限。
+
+central 模式的前端把 CSRF 只保存在内存，并在所有已认证请求上发送 `X-CSRF-Token`，包括 GET。受保护路由缺少或带错 proof 都返回 403，避免另一个标签页替换 cookie 后，旧页面把新账户的数据放入旧用户界面。写请求还必须通过 Origin 检查。专用的 `/central/session` bootstrap 可以不带 proof；若提供 proof，仍必须匹配。`/auth/me` 不能充当隐式 bootstrap。
+
+退出成功只提交撤销，不发删除 session cookie 的 `Set-Cookie`。这样延迟返回的旧退出请求不会清除另一次新登录的 cookie。已撤销 cookie 最迟随原 session 的 5 分钟绝对期限过期；网络或数据库错误时，前端保持可重试状态，不宣称已退出。全部 session 撤销只作用于本地 human sessions，API Key 和 MCP machine credentials 使用各自的生命周期。
+
+`/central/session` 在共享身份未启用时返回 503 `CENTRAL_DISABLED`，浏览器启动将这个明确的 capability 状态视为未登录。已启用服务的中央状态不可用或过期仍返回 503 `CENTRAL_UNAVAILABLE`，不能因此降级到旧登录；失效的身份或 session 返回 401；需要更强证明时返回 403 `CENTRAL_PROOF_REQUIRED`，有效的普通 session 不因此被删除。这里的错误码是 JSON 顶层的字符串 `code`。资源 owner、团队角色和余额规则继续由各产品模块决定。生产时限及恢复规则见[共享身份部署](../operations/shared_identity_deployment.md)。
 
 ## 全局入口
 
@@ -53,14 +79,14 @@ RequestLogger
 | `/health`、`/setup/status` | 无 | `server/router.go`；进程健康检查和正常模式下的 setup 状态 |
 | `/api/event_logging/batch` | 无 | 兼容 Claude Code 遥测的空接收端，固定返回成功 |
 | `/api/v1/auth/*` | 大多公开，账户管理的子流程按路由加 JWT 或短期状态 | `app/http_routes.go`；注册、登录、刷新、找回密码、OAuth、Passkey 登录和身份补全 |
-| `/api/v1/user/*`、`/keys`、`/team`、`/groups`、`/subscriptions`、`/redeem` 等 | 用户 JWT | `app/http_routes.go`；用户面板的资源、团队、Key、用量和权益查询 |
+| `/api/v1/user/*`、`/keys`、`/team`、`/groups`、`/subscriptions`、`/redeem` 等 | 用户 JWT 或已启用的 central cookie | `app/http_routes.go`；用户面板的资源、团队、Key、用量和权益查询；中央会话还按所选资源检查 assurance |
 | `/api/v1/marketplace/models`、`/api/v1/marketplace/stats` | 无 | `routing/httpapi`；公开模型分组和首页汇总 |
-| `/api/v1/marketplace/models/available` | 用户 JWT | `routing/httpapi`；公开分组和当前用户获授权的专属分组，使用私有、不缓存的响应 |
+| `/api/v1/marketplace/models/available` | 用户 JWT 或已启用的 central cookie | `routing/httpapi`；公开分组和当前用户获授权的专属分组，使用私有、不缓存的响应 |
 | `/api/v1/admin/plugins*`、`/api/v1/admin/plugin-catalog*`、`/api/v1/admin/plugin-indexes*` | 管理员，执行代码与来源变更另需 step-up | `plugin/httpapi`；安装、更新回滚、市场与索引来源，见[安装管理](plugin_contracts.md#administration) |
-| `/api/v1/plugins/*` | UI 描述要求用户 JWT，资源公开，API 按 manifest 选择认证 | `plugin/httpapi`；插件页面描述、版本化静态资源和非流式 HTTP 代理，见[插件契约](plugin_contracts.md#http_contributions) |
+| `/api/v1/plugins/*` | UI 描述要求用户 JWT 或 central cookie，资源公开，API 按 manifest 选择认证 | `plugin/httpapi`；插件页面描述、版本化静态资源和非流式 HTTP 代理，见[插件契约](plugin_contracts.md#http_contributions) |
 | `/api/v1/admin/*` | 管理员 JWT 或受限的管理密钥；部分操作还需要 step-up | `app/http_routes_admin.go`；用户、分组、提供商、价格配置、设置、运维、备份、支付和安全管理 |
 | `/mcp` | 专用 MCP Bearer 令牌 | 四个通用管理工具，按具体操作授权；协议为 MCP JSON-RPC，见 [MCP 管理接口](mcp_management.md) |
-| `/api/v1/payment/*` | 用户 JWT | `app/http_routes.go`；读取配置和套餐、下单、查单、取消、invoice 和申请退款 |
+| `/api/v1/payment/*` | 用户 JWT 或已启用的 central cookie | `app/http_routes.go`；读取配置和套餐、下单、查单、取消、invoice 和申请退款 |
 | `/api/v1/payment/public/*` | 签名的 resume token，或旧订单的验证约束 | 恢复支付结果；这组接口只服务已知订单，匿名列举订单是不允许的 |
 | `/api/v1/payment/webhook/*` | 提供商验签 | EasyPay、Alipay、WeChat Pay、Stripe、Airwallex 的通知 |
 | `/v1/*` 和兼容的裸路径别名 | TokenRouter API Key | Anthropic 和 OpenAI 兼容的消息、Responses、Chat、图片、视频、模型、用量和批任务 |
@@ -260,6 +286,7 @@ Key 自身的配额和滚动限额字段不受这些展示规则影响。
 | 凭据 | 放在哪里 | 授权范围 |
 | --- | --- | --- |
 | JWT access token | 面板的 `Authorization: Bearer`，少数 WebSocket 用子协议 | 检查当前用户状态、token version 和可选的会话绑定；管理员还检查当前角色 |
+| central session | `HttpOnly` cookie 加内存中的 `X-CSRF-Token` | 检查当前中央状态、原始 admission、固定时限与本地账户；受保护读取也需要 CSRF，资源权限继续独立判断 |
 | Refresh token | `/api/v1/auth/refresh`，以及 logout 约定的 payload 或 cookie | 只用于轮换和撤销，无法直接访问业务资源 |
 | 管理 API Key | 管理接口的 `x-api-key` | 代表第一个实际的管理员；开启敏感操作 step-up 后，需要近期 TOTP 的操作无法用它执行 |
 | TokenRouter API Key | 网关的 `Authorization: Bearer`、`x-api-key`，Gemini 兼容入口还有 `x-goog-api-key` | Key、用户和团队、分组、IP、额度和订阅、请求资源的归属；通用网关拒绝放在 query 里的 Key |
@@ -275,6 +302,8 @@ Key 自身的配额和滚动限额字段不受这些展示规则影响。
 外部支付服务使用管理 API Key，通过 `x-api-key` 调用管理路由；管理员 JWT 适合交互式的管理端。支付成功后的余额发放，优先使用 `POST /api/v1/admin/redeem-codes/create-and-redeem`，由服务端原子地创建并兑换余额兑换码。调用方要提供稳定的业务 `code` 和 `Idempotency-Key`，同一操作重试时复用这两个值，并按 200、409 和业务错误区分重放、冲突和失败。`GET /api/v1/admin/users/:id` 可以用来做前置查询；`POST /api/v1/admin/users/:id/balance` 只用于明确的人工增减或补偿，同样需要幂等键。
 
 购买页和用户自定义页面的 URL 由前端追加 `user_id`、`token`、`theme`、`lang`、`ui_mode`、`src_host` 和 `src_url`。其中 `token` 是用户的 Bearer 凭据，只能发给部署者信任、并且使用 HTTPS 的页面；接收方不应把它写进访问日志、分析参数，或转发给第三方。完整的请求示例和重试约定见[外部支付管理 API 指南](../guides/payments/admin_integration_api.md)。
+
+central 模式没有可供这些页面转发的 Bearer token，相关占位值为空；HttpOnly cookie 和 provider credential 不进入嵌入 URL。依赖旧 token 参数的外部页面需要单独接入，不能把用户 ID 当作替代凭据。
 
 ## API Key 上游用量查询
 

@@ -182,6 +182,17 @@ function mountLogin() {
   })
 }
 
+// clickPasskey selects the action by its rendered label because the login page
+// can contain several secondary buttons. Requiring exactly one match prevents
+// the cancellation case from passing after clicking an unrelated provider.
+async function clickPasskey(wrapper: ReturnType<typeof mountLogin>): Promise<void> {
+  const buttons = wrapper
+    .findAll('button')
+    .filter((button) => button.text() === 'auth.passkeySignIn')
+  expect(buttons).toHaveLength(1)
+  await buttons[0]!.trigger('click')
+}
+
 // enableAliyunCaptcha configures the login settings fixture for Aliyun action
 // verification. It disables Tencent and Turnstile, provides a complete scene
 // configuration, and supplies a matching verification parameter for submission
@@ -337,7 +348,7 @@ describe('Action captcha gate', () => {
     const wrapper = mountLogin()
     await flushPromises()
 
-    await wrapper.get('button.btn-secondary.w-full').trigger('click')
+    await clickPasskey(wrapper)
     await flushPromises()
 
     expect(verifyActionMock).toHaveBeenCalledOnce()
@@ -355,9 +366,10 @@ describe('Action captcha gate', () => {
     const wrapper = mountLogin()
     await flushPromises()
 
-    await wrapper.get('button.btn-secondary.w-full').trigger('click')
+    await clickPasskey(wrapper)
     await flushPromises()
 
+    expect(verifyActionMock).toHaveBeenCalledOnce()
     expect(loginWithPasskeyMock).not.toHaveBeenCalled()
   })
 
@@ -410,7 +422,7 @@ describe('Action captcha gate', () => {
     const wrapper = mountLogin()
     await flushPromises()
 
-    await wrapper.get('button.btn-secondary.w-full').trigger('click')
+    await clickPasskey(wrapper)
     await flushPromises()
 
     expect(verifyActionMock).toHaveBeenCalledOnce()

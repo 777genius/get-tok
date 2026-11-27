@@ -446,6 +446,9 @@ func (s *AuthService) ValidatePasswordCredentials(ctx context.Context, email, pa
 	if !s.CheckPassword(password, user.PasswordHash) {
 		return nil, ErrInvalidCredentials
 	}
+	if user.CentralManaged {
+		return nil, ErrCentralLoginRequired
+	}
 	return user, nil
 }
 

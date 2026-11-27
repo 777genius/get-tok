@@ -1,4 +1,7 @@
 # syntax=docker/dockerfile:1.7
+# Dockerfile builds the frontend and Go backend before assembling the production
+# image. Builder versions follow the repository toolchain pins so dependency
+# security fixes reach both compiled binaries and embedded browser assets.
 # =============================================================================
 # TokenRouter Multi-Stage Dockerfile
 # =============================================================================
@@ -8,7 +11,7 @@
 # =============================================================================
 
 ARG NODE_IMAGE=node:26.12.1-alpine
-ARG GOLANG_IMAGE=golang:1.27.3-alpine
+ARG GOLANG_IMAGE=golang:1.27.4-alpine
 ARG ALPINE_IMAGE=alpine:3.21
 ARG POSTGRES_IMAGE=postgres:18-alpine
 ARG GOPROXY=https://goproxy.cn,direct

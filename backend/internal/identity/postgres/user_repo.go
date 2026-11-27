@@ -1965,6 +1965,7 @@ func (r *UserStore) IdentityCreateWithClient(ctx context.Context, client *dbent.
 		SetUsername(userIn.Username).
 		SetNotes(userIn.Notes).
 		SetPasswordHash(userIn.PasswordHash).
+		SetCentralManaged(userIn.CentralManaged).
 		SetRole(userIn.Role).
 		SetConcurrency(userIn.Concurrency).
 		SetStatus(userIn.Status).

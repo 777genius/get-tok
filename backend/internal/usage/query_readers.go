@@ -11,7 +11,17 @@ import (
 // beyond the base interface. UsageService selects those capabilities at
 // construction and uses reduced-argument repository queries when a selected
 // capability is absent. Callers choose a reader whose supported selectors match
-// the scope of their query.
+// the scope of their query. Personal-only queries require a matching capability
+// and fail closed when its contract is absent, because a reduced argument list
+// cannot retain their persisted team exclusion.
+
+// PersonalDashboardReader supplies counters restricted to a user's personal resources.
+type PersonalDashboardReader interface {
+	// GetPersonalDashboardStats returns key counts, retained totals and recent
+	// rates with both key and usage team attribution excluded in storage.
+	// Implementations must not derive this restriction from current membership.
+	GetPersonalDashboardStats(context.Context, int64) (*UserDashboardStats, error)
+}
 
 // UsageTrendWithFiltersRepo supplies trend queries accepting the unified usage
 // filter object.
@@ -71,7 +81,8 @@ type QueryReaders struct {
 	// UsageTrendWithFiltersRepo, ModelStatsWithUsageFiltersRepo,
 	// ModelStatsBySourceRepo, GroupStatsWithUsageFiltersRepo, and UserStatsReader
 	// are optional query capabilities. Nil lets the service try its remaining
-	// paths; model queries can try another capability before the base method.
+	// paths when those signatures can preserve the requested resource scope.
+	// Personal-only queries cannot fall back to reduced scalar signatures.
 	// Supplying QueryReaders to NewUsageService replaces the discovered set in
 	// full, including fields left nil.
 	UsageTrendWithFiltersRepo      UsageTrendWithFiltersRepo      // unified filtered trend reader
@@ -79,12 +90,16 @@ type QueryReaders struct {
 	ModelStatsBySourceRepo         ModelStatsBySourceRepo         // scalar model dimension reader
 	GroupStatsWithUsageFiltersRepo GroupStatsWithUsageFiltersRepo // unified group totals reader
 	UserStatsReader                UserStatsReader                // reduced user summary reader
+	// PersonalDashboardReader is required for explicitly personal dashboard reads.
+	// An absent implementation causes a scope-unavailable error instead of falling
+	// back to the legacy owner-visible dashboard.
+	PersonalDashboardReader PersonalDashboardReader // persisted personal-only dashboard reader
 }
 
 // queryReaders discovers optional query capabilities implemented by the
 // supplied repository. Failed capability assertions leave individual fields
-// nil, letting UsageService try its remaining optional capabilities or the
-// base repository path for each query.
+// nil. UsageService may choose remaining readers only when their contract
+// retains the requested scope; missing personal capabilities fail closed.
 func queryReaders(repo UsageLogRepository) QueryReaders {
 	out := QueryReaders{}
 	out.UsageTrendWithFiltersRepo, _ = repo.(UsageTrendWithFiltersRepo)
@@ -92,5 +107,6 @@ func queryReaders(repo UsageLogRepository) QueryReaders {
 	out.ModelStatsBySourceRepo, _ = repo.(ModelStatsBySourceRepo)
 	out.GroupStatsWithUsageFiltersRepo, _ = repo.(GroupStatsWithUsageFiltersRepo)
 	out.UserStatsReader, _ = repo.(UserStatsReader)
+	out.PersonalDashboardReader, _ = repo.(PersonalDashboardReader)
 	return out
 }

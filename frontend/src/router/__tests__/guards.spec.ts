@@ -78,7 +78,7 @@ describe('application authentication guard', () => {
   // storage. Permission checks observe that restored state, and later
   // navigations do not restore it again.
   it('restores authentication once before checking access', async () => {
-    authStore.checkAuth.mockImplementation(() => {
+    authStore.initializeSession.mockImplementation(() => {
       authStore.isAuthenticated = true
       authStore.isAdmin = true
     })
@@ -88,8 +88,55 @@ describe('application authentication guard', () => {
     const second = runGuard('/dashboard')
     await second.navigation
     expect(second.next).toHaveBeenCalledExactlyOnceWith()
-    expect(authStore.checkAuth).toHaveBeenCalledTimes(1)
+    expect(authStore.initializeSession).toHaveBeenCalledTimes(1)
   })
+
+  // A public page remains usable while session restoration temporarily fails.
+  // Later protected navigation retries restoration and admits the recovered cookie session.
+  it('retries restoration after an unavailable public-page initialization', async () => {
+    authStore.initializeSession
+      .mockRejectedValueOnce({ status: 503, code: 'CENTRAL_UNAVAILABLE' })
+      .mockImplementationOnce(() => {
+        authStore.isAuthenticated = true
+      })
+    const first = runGuard('/models')
+    await first.navigation
+    expect(first.next).toHaveBeenCalledExactlyOnceWith()
+
+    const recovered = runGuard('/dashboard')
+    await recovered.navigation
+    expect(recovered.next).toHaveBeenCalledExactlyOnceWith()
+
+    const later = runGuard('/dashboard')
+    await later.navigation
+    expect(later.next).toHaveBeenCalledExactlyOnceWith()
+    expect(authStore.initializeSession).toHaveBeenCalledTimes(2)
+  })
+
+  // The callback owns its first restoration, which can either adopt the cookie or fail.
+  // Later protected navigation initializes once, retaining success or retrying the failed attempt.
+  it.each([false, true])(
+    'delegates the callback and initializes later navigation for failure=%s',
+    async (failed) => {
+      const callback = runGuard('/auth/central/callback')
+      await callback.navigation
+      expect(callback.next).toHaveBeenCalledExactlyOnceWith()
+      expect(authStore.initializeSession).not.toHaveBeenCalled()
+
+      authStore.isAuthenticated = !failed
+      authStore.initializeSession.mockImplementationOnce(() => {
+        authStore.isAuthenticated = true
+      })
+      const dashboard = runGuard('/dashboard')
+      await dashboard.navigation
+      expect(dashboard.next).toHaveBeenCalledExactlyOnceWith()
+
+      const later = runGuard('/dashboard')
+      await later.navigation
+      expect(later.next).toHaveBeenCalledExactlyOnceWith()
+      expect(authStore.initializeSession).toHaveBeenCalledTimes(1)
+    },
+  )
 
   // An unauthenticated protected-page visit still assigns its document title.
   // The resolved route title and current site name reach the browser before

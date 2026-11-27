@@ -20,6 +20,8 @@ const mocks = vi.hoisted(() => ({
   register: vi.fn(),
   passkey: vi.fn(),
   startOAuth: vi.fn(),
+  centralConfig: vi.fn(), // Advertised shared authentication providers.
+  centralStart: vi.fn(), // Central login intent capture.
   verify: vi.fn(),
   warning: vi.fn(),
   error: vi.fn(),
@@ -67,6 +69,9 @@ vi.mock('@/api/auth', async (importOriginal) => ({
   // isWeChatWebOAuthEnabled disables the unrelated WeChat entry in these login
   // fixtures.
   isWeChatWebOAuthEnabled: () => false,
+}))
+vi.mock('@/api/centralAuth', () => ({
+  centralAuthAPI: { configuration: mocks.centralConfig, start: mocks.centralStart },
 }))
 vi.mock('@/composables/useBalanceDisplay', () => ({
   // useBalanceDisplay supplies the promotion-bonus formatter used by the
@@ -161,6 +166,10 @@ describe.each(['login', 'register'] as const)('%s 协议提交门禁', (page) =>
     vi.stubGlobal('location', mocks.location)
     mocks.location.href = `http://localhost/${page}`
     mocks.settings.mockResolvedValue({ ...baseSettings })
+    mocks.centralConfig.mockResolvedValue({ enabled: false, providers: [] })
+    mocks.centralStart.mockResolvedValue({
+      authorization_url: 'https://identity.example.test/authorize',
+    })
     mocks.verify.mockResolvedValue({ token: 'proof', randstr: 'random' })
     mocks.startOAuth.mockResolvedValue({ authorize_url: 'https://example.com/oauth' })
     mocks.login.mockResolvedValue({})
@@ -261,6 +270,46 @@ describe.each(['login', 'register'] as const)('%s 协议提交门禁', (page) =>
       expect(mocks.startOAuth).toHaveBeenCalledTimes(1)
     },
   )
+
+  // Central GitHub login and explicit registration share the existing consent and
+  // captcha gates. Provider selection cannot navigate or create an account before both pass.
+  it('gates direct central provider intent behind consent and captcha', async () => {
+    mocks.settings.mockResolvedValue({
+      ...baseSettings,
+      tencent_captcha_enabled: true,
+      tencent_captcha_app_id: 'app-id',
+    })
+    mocks.centralConfig.mockResolvedValue({
+      enabled: true,
+      provider_name: 'Shared identity',
+      providers: [{ id: 'github', label: 'GitHub' }],
+    })
+    const view = await mountPage(page)
+    const button = view
+      .findAll('button')
+      .find((candidate) =>
+        candidate
+          .text()
+          .includes(page === 'login' ? 'auth.central.signIn' : 'auth.central.register'),
+      )!
+    await button.trigger('click')
+    await flushPromises()
+    expect(mocks.centralStart).not.toHaveBeenCalled()
+    expect(mocks.verify).not.toHaveBeenCalled()
+    await view.get('#login-agreement-consent').setValue(true)
+    await button.trigger('click')
+    await flushPromises()
+    expect(mocks.centralStart).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        intent: page === 'login' ? 'login' : 'register',
+        provider: 'github',
+        tencent_captcha_ticket: 'proof',
+        tencent_captcha_randstr: 'random',
+      }),
+    )
+    expect(mocks.location.href).toBe('https://identity.example.test/authorize')
+    expect(mocks.startOAuth).not.toHaveBeenCalled()
+  })
 
   // Storage contains consent for a particular agreement revision. The same
   // revision must allow authentication while a later revision requires a new

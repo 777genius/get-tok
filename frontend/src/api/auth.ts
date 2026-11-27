@@ -1,4 +1,10 @@
+import type { AxiosRequestConfig } from 'axios'
 import { apiClient } from './client'
+import {
+  authenticationEpoch,
+  assertAuthenticationEpoch,
+  type AuthenticationRequest,
+} from './authenticationContext'
 import { buildApiUrl } from './url'
 import { refreshAuthTokens, type RefreshTokenResponse } from './tokenRefresh'
 export type { RefreshTokenResponse } from './tokenRefresh'
@@ -172,8 +178,8 @@ export function getAuthToken(): string | null {
 
 /**
  * getRefreshToken reads the rotation credential from browser storage. A missing
- * entry returns null, letting logout skip server revocation and refresh callers
- * detect that session rotation is unavailable.
+ * entry returns null, omitting the optional logout refresh payload and letting
+ * refresh callers detect that session rotation is unavailable.
  */
 export function getRefreshToken(): string | null {
   return localStorage.getItem('refresh_token')
@@ -199,9 +205,13 @@ export function clearAuthToken(): void {
  * that order. These writes are sequential and storage failures propagate after
  * any preceding write, so callers cannot treat publication as one atomic storage
  * operation.
+ * The request generation is checked again immediately before publication, so
+ * a session adopted during response handling prevents every storage write.
  */
 export async function login(credentials: LoginRequest): Promise<LoginResponse> {
+  const expected = authenticationEpoch()
   const { data } = await apiClient.post<LoginResponse>('/auth/login', credentials)
+  assertAuthenticationEpoch(expected)
 
   // A challenge response is not a completed login; publish credentials and user data only after the response passes the TOTP discriminator.
   if (!isTotp2FARequired(data)) {
@@ -226,9 +236,13 @@ export async function login(credentials: LoginRequest): Promise<LoginResponse> {
  * entries untouched. Storage exceptions propagate after any preceding write, so
  * this sequence provides ordered publication rather than rollback of a partially
  * written session.
+ * A replacement session during response handling rejects the old completion
+ * before its credentials reach persistent browser storage.
  */
 export async function login2FA(request: TotpLogin2FARequest): Promise<AuthResponse> {
+  const expected = authenticationEpoch()
   const { data } = await apiClient.post<AuthResponse>('/auth/login/2fa', request)
+  assertAuthenticationEpoch(expected)
 
   // Publish the access token and available companion values before the user snapshot so subsequent browser reads can observe the completed authentication data.
   setAuthToken(data.access_token)
@@ -251,9 +265,13 @@ export async function login2FA(request: TotpLogin2FARequest): Promise<AuthRespon
  * storage exception interrupts the sequence after any earlier writes. Consumers
  * therefore receive a completed response only after these storage operations
  * finish successfully.
+ * The captured generation must still own the browser at publication; otherwise
+ * the response rejects without restoring credentials from the earlier request.
  */
 export async function register(userData: RegisterRequest): Promise<AuthResponse> {
+  const expected = authenticationEpoch()
   const { data } = await apiClient.post<AuthResponse>('/auth/register', userData)
+  assertAuthenticationEpoch(expected)
 
   // Publish the access token and available companion values before the user snapshot so subsequent browser reads can observe the completed authentication data.
   setAuthToken(data.access_token)
@@ -278,23 +296,21 @@ export async function getCurrentUser() {
 }
 
 /**
- * logout attempts to revoke the stored refresh token before clearing local
- * authentication values. Revocation errors are ignored so local logout can still
- * complete; localStorage access errors continue to propagate.
+ * logout asks the server to withdraw the actual browser session before clearing
+ * local authentication values. The request is sent even without a refresh token,
+ * because an opaque central cookie may still require durable revocation. Every
+ * rejection propagates instead of claiming local logout completed. The captured
+ * generation reaches Axios before dispatch, and a later session keeps its own
+ * credentials when the earlier request completes.
  */
-export async function logout(): Promise<void> {
+export async function logout(expected = authenticationEpoch()): Promise<void> {
   const refreshToken = getRefreshToken()
-
-  // Try to revoke the refresh token on the server
-  if (refreshToken) {
-    try {
-      await apiClient.post('/auth/logout', { refresh_token: refreshToken })
-    } catch {
-      // A failed server revocation should still allow this browser to log out, so continue to clear local session values.
-    }
+  const options: AxiosRequestConfig & Pick<AuthenticationRequest, '_authenticationEpoch'> = {
+    _authenticationEpoch: expected,
   }
+  await apiClient.post('/auth/logout', refreshToken ? { refresh_token: refreshToken } : {}, options)
 
-  clearAuthToken()
+  if (authenticationEpoch() === expected) clearAuthToken()
 }
 
 /**
