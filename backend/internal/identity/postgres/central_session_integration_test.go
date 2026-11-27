@@ -85,7 +85,11 @@ func TestCentralStoreAtomicOwnership(t *testing.T) {
 	require.Equal(t, 1, successes)
 
 	first := centralCompletion(now, "one", "first@example.invalid", "session-one")
+	first.Session.Admission.ValidUntil = first.Session.Admission.ValidUntil.Add(999 * time.Nanosecond)
 	second := centralCompletion(now, "one", "second@example.invalid", "session-two")
+	bound, err := store.HasBinding(ctx, first.Status.Account, first.Issuer, first.Subject)
+	require.NoError(t, err)
+	require.False(t, bound)
 	type result struct {
 		commit identity.CentralLoginCommit // committed local owner and issued session
 		err    error                       // database transaction result
@@ -112,11 +116,29 @@ func TestCentralStoreAtomicOwnership(t *testing.T) {
 		userID = result.commit.User.ID
 		require.Equal(t, float64(17), result.commit.User.Balance)
 		require.True(t, result.commit.User.CentralManaged)
+		persisted, err := store.ReadSession(ctx, result.commit.Session.Digest)
+		require.NoError(t, err)
+		require.Equal(t, result.commit.Session, persisted, "raw admission and local expiry must survive PostgreSQL round trip")
 	}
 	require.Equal(t, 1, created)
 	var count int
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM users").Scan(&count))
 	require.Equal(t, 1, count)
+	bound, err = store.HasBinding(ctx, first.Status.Account, first.Issuer, first.Subject)
+	require.NoError(t, err)
+	require.True(t, bound)
+	_, err = store.HasBinding(ctx, first.Status.Account, first.Issuer, "different-subject")
+	require.ErrorIs(t, err, identity.ErrCentralConflict)
+	_, err = store.HasBinding(ctx, first.Status.Account, "https://other.example.test", first.Subject)
+	require.ErrorIs(t, err, identity.ErrCentralConflict)
+	retry := first
+	retry.NewUser, retry.Artifacts = nil, nil
+	retry.Session.Digest = identity.CentralSecretDigest("registration-retry")
+	retried, err := store.CompleteLogin(ctx, retry)
+	require.NoError(t, err)
+	require.False(t, retried.Created)
+	require.Equal(t, userID, retried.User.ID)
+	require.Equal(t, float64(17), retried.User.Balance)
 	// The duplicate digest fails after a different new user and binding were
 	// written. Their absence proves registration joined the outer transaction.
 	conflict := centralCompletion(now, "other", "rollback@example.invalid", "session-one")
@@ -131,6 +153,15 @@ func TestCentralStoreAtomicOwnership(t *testing.T) {
 	conflict = centralCompletion(now, "email-collision", originalEmail, "email-session")
 	_, err = store.CompleteLogin(ctx, conflict)
 	require.ErrorIs(t, err, identity.ErrCentralConflict)
+	// Removing the binding invalidates the earlier preflight. The commit must
+	// reject missing creation artifacts instead of recreating ownership implicitly.
+	_, err = db.ExecContext(ctx, "DELETE FROM central_identity_bindings WHERE account_id='one'")
+	require.NoError(t, err)
+	retry.Session.Digest = identity.CentralSecretDigest("removed-binding-retry")
+	_, err = store.CompleteLogin(ctx, retry)
+	require.ErrorIs(t, err, identity.ErrCentralEvidenceInvalid)
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT count(*) FROM central_identity_sessions WHERE token_hash=$1", retry.Session.Digest).Scan(&count))
+	require.Zero(t, count)
 }
 
 // TestCentralStoreBindingAndRevocation changes legacy credentials around an

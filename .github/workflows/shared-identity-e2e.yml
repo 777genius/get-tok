@@ -63,7 +63,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: agent-teams-ai/identity
-          ref: 5fea712f3c41e6aa66080def005fbbc94a7f3abe
+          ref: 6aadd62e4ab85a8cd1f0888b8b012ffc83c5ca6f
           path: identity
           persist-credentials: false
       - name: Install the consumer Go toolchain

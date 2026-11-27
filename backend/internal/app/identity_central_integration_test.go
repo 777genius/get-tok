@@ -245,7 +245,11 @@ func TestCentralNativeBFFCookieFlow(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT account_id,authority_incarnation,(status_evidence->>'Revision')::bigint FROM central_identity_bindings WHERE local_user_id=$1", next.User.ID).Scan(&accountID, &incarnation, &revision))
 	require.Positive(t, revision)
 	centralNativeCommand(t, "GETTOK_NATIVE_LIFECYCLE_COMMAND", accountID, incarnation, "suspend", strconv.FormatUint(revision, 10))
+	// Bound the entire response interval by the original session deadline so
+	// an expiry rejection cannot masquerade as an observed central suspension.
+	require.True(t, time.Now().Add(identity.CentralClockUncertainty).Before(next.ExpiresAt), "session must remain outside the expiry margin before the suspension request")
 	response, _ = centralNativeRequest(t, httpClient, http.MethodGet, origin.String()+"/api/v1/auth/me", "", "", next.CSRFToken)
+	require.True(t, time.Now().Add(identity.CentralClockUncertainty).Before(next.ExpiresAt), "session must remain outside the expiry margin after the suspension response")
 	require.Equal(t, http.StatusUnauthorized, response.StatusCode, "fresh central suspension must invalidate the original BFF cookie")
 	t.Log(`{"nativeGetTokStage":"central-revocation-verified"}`)
 	var preservedBalance float64

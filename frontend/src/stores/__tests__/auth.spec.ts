@@ -7,6 +7,13 @@ import { useAuthStore } from '@/stores/auth'
 // while fake timers hold background polling. Assertions check both reactive identity and
 // browser storage, including pending authentication that can survive a failed
 // registration.
+//
+// Successful provider authentication does not guarantee successful browser
+// publication: storage can reject a write after the store advances ownership.
+// The passkey regression reproduces that boundary with the real session helper
+// and verifies reactive identity, persisted credentials, and owned timers together.
+// Existing challenge, account-role, and profile tests retain their independent
+// endpoint fixtures, so rollback assertions do not replace ordinary login behavior.
 
 // Authentication endpoint spies control successful responses and failures independently;
 // each test uses a fresh Pinia store and isolated browser session storage.
@@ -16,6 +23,7 @@ const mockLogout = vi.fn()
 const mockGetCurrentUser = vi.fn()
 const mockRegister = vi.fn()
 const mockRefreshToken = vi.fn()
+const mockPasskeyLogin = vi.fn()
 
 vi.mock('@/api', () => ({
   authAPI: {
@@ -26,6 +34,7 @@ vi.mock('@/api', () => ({
     register: (...args: any[]) => mockRegister(...args),
     refreshToken: (...args: any[]) => mockRefreshToken(...args),
   },
+  passkeyAPI: { login: (...args: any[]) => mockPasskeyLogin(...args) },
   isTotp2FARequired: (response: any) => response?.requires_2fa === true,
 }))
 
@@ -120,6 +129,37 @@ describe('useAuthStore', () => {
       expect(store.token).toBeNull()
       expect(store.isAuthenticated).toBe(false)
     })
+  })
+
+  // Passkey authentication succeeds before browser storage rejects user publication.
+  // The newly installed generation must roll back every partial credential and timer.
+  it('rolls back passkey publication when browser storage refuses the user record', async () => {
+    mockPasskeyLogin.mockResolvedValue(fakeAuthResponse)
+    const store = useAuthStore()
+    const originalSetItem = Storage.prototype.setItem
+    const storageFailure = new DOMException('Storage quota exceeded', 'QuotaExceededError')
+    const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (
+      this: Storage,
+      key: string,
+      value: string,
+    ) {
+      if (key === 'auth_user') throw storageFailure
+      originalSetItem.call(this, key, value)
+    })
+    try {
+      await expect(store.loginWithPasskey()).rejects.toBe(storageFailure)
+      expect(store.isAuthenticated).toBe(false)
+      expect(store.authMode).toBeNull()
+      expect(store.token).toBeNull()
+      expect(store.user).toBeNull()
+      for (const key of ['auth_token', 'auth_user', 'refresh_token', 'token_expires_at']) {
+        expect(localStorage.getItem(key)).toBeNull()
+      }
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      write.mockRestore()
+      store.$dispose()
+    }
   })
 
   describe('login2FA', () => {

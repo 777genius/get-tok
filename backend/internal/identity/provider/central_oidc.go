@@ -13,8 +13,8 @@ import (
 )
 
 // central_oidc.go supplies the central browser flow with bounded credential
-// transport. Its configured endpoints are validated during composition; every
-// request uses ordinary verified TLS, a finite timeout and a strict response
+// transport. Its configured endpoints are validated during composition; the
+// client retains system TLS verification, finite timeouts and a strict response
 // bound. Redirects are returned as failures so neither authorization codes nor
 // client credentials can be forwarded to an unexpected destination.
 //
@@ -54,7 +54,11 @@ func (c *CentralOIDCClient) ExchangeCode(ctx context.Context, options OIDCOption
 		return nil, err
 	}
 	var token identity.OIDCTokenResponse
-	if json.Unmarshal(data, &token) != nil || token.TokenType != "Bearer" && token.TokenType != "bearer" || token.AccessToken == "" || token.IDToken == "" {
+	// OAuth token_type is case-insensitive. Accept its valid letter cases while
+	// retaining the exact credentials and rejecting every other token scheme.
+	if json.Unmarshal(data, &token) != nil ||
+		!strings.EqualFold(token.TokenType, "Bearer") ||
+		token.AccessToken == "" || token.IDToken == "" {
 		return nil, identity.ErrCentralEvidenceInvalid
 	}
 	// This first profile has no upstream refresh lifecycle. Discard the optional
@@ -63,10 +67,15 @@ func (c *CentralOIDCClient) ExchangeCode(ctx context.Context, options OIDCOption
 	return &token, nil
 }
 
-// FetchUserInfo retrieves the access credential's subject and optional
-// verified profile through bounded transport. The core must compare that
-// subject with the signed ID token before using any profile data for
-// registration.
+// FetchUserInfo retrieves the access credential's literal subject and optional
+// profile through bounded transport. It requires a nonempty JSON string named
+// sub and preserves that value exactly, including whitespace, for the core's
+// comparison with the signed ID token before any profile data is used.
+//
+// Suggested profile fields retain the legacy parser's configured mappings.
+// Its subject fallbacks and trimming do not apply to central authentication:
+// a generic identifier or normalized value cannot substitute for the UserInfo
+// subject that the provider actually returned.
 func (c *CentralOIDCClient) FetchUserInfo(ctx context.Context, options OIDCOptions, token *identity.OIDCTokenResponse) (*identity.OIDCUserInfoClaims, error) {
 	if token == nil || token.AccessToken == "" || strings.ContainsAny(token.AccessToken, " \t\r\n") {
 		return nil, identity.ErrCentralEvidenceInvalid
@@ -80,10 +89,19 @@ func (c *CentralOIDCClient) FetchUserInfo(ctx context.Context, options OIDCOptio
 	if err != nil {
 		return nil, err
 	}
-	if !json.Valid(data) {
+	var userInfo map[string]json.RawMessage
+	if json.Unmarshal(data, &userInfo) != nil {
 		return nil, identity.ErrCentralEvidenceInvalid
 	}
-	return OidcParseUserInfo(string(data), options), nil
+	var subject string
+	if json.Unmarshal(userInfo["sub"], &subject) != nil || subject == "" {
+		return nil, identity.ErrCentralEvidenceInvalid
+	}
+	claims := OidcParseUserInfo(string(data), options)
+	// The legacy parser accepts alternate ID paths and trims identifiers. Keep
+	// the literal sub so Finish compares the provider's unchanged subject.
+	claims.Subject = subject
+	return claims, nil
 }
 
 // ValidateIDToken loads bounded trusted keys and invokes the shared signature,

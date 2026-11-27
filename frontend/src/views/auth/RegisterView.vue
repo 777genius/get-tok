@@ -1070,10 +1070,17 @@ async function acquireActionProof(): Promise<boolean> {
 
 // handleOAuthStart applies consent and loading gates before provider navigation.
 // Legacy entries without action captcha retain direct navigation. Central entries
-// always record explicit intent with the backend first. Captcha proof is consumed
-// after either start request settles, and both paths share the same consent gate.
+// always record explicit intent with the backend first. A required central invitation
+// must be nonblank before consuming captcha proof or starting provider navigation;
+// the backend still validates and consumes the invitation atomically. Captcha proof
+// is consumed after either start request settles, and both paths share the same
+// consent gate. Legacy registration keeps its existing provider continuation rules.
 async function handleOAuthStart(request: OAuthLoginStart | CentralLoginSelection): Promise<void> {
   if (registrationActionDisabled.value || !ensureAgreementAccepted()) return
+  if (request.provider === 'central' && invitationCodeEnabled.value) {
+    errors.invitation_code = formData.invitation_code.trim() ? '' : t('auth.invitationCodeRequired')
+    if (errors.invitation_code) return
+  }
 
   if (!actionCaptchaEnabled.value && request.provider !== 'central') {
     window.location.href = buildOAuthLoginStartURL(request)

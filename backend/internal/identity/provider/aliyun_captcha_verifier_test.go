@@ -101,6 +101,9 @@ func TestAliyunCaptchaVerifier_APIErrorNormalized(t *testing.T) {
 func TestAliyunCaptchaVerifier_TransportError(t *testing.T) {
 	server := httptest.NewServer(http.NotFoundHandler())
 	endpoint := strings.TrimPrefix(server.URL, "http://")
+	// The SDK matches complete endpoint names, including ports. Keep this
+	// closed fixture off inherited proxies so refusal remains a local transport error.
+	t.Setenv("NO_PROXY", os.Getenv("NO_PROXY")+","+endpoint)
 	// Close the fixture listener before verification so the request fails during
 	// transport setup and never obtains a provider JSON error response.
 	server.Close()

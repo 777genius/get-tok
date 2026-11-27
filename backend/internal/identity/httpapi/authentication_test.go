@@ -97,47 +97,58 @@ func newAuthenticationWithdrawalFixture(t *testing.T) *authenticationWithdrawalF
 }
 
 // TestAuthenticationLogoutWithRetainedCentralCookie checks actual refresh-token
-// withdrawal after central logout or expiry. Live and unobserved cookies still
-// reject mixed credentials without invoking legacy credential persistence.
+// withdrawal after central logout or expiry, with and without a legacy access
+// token. Live, unknown and unreadable cookies retain central proof checks and
+// cannot invoke legacy credential persistence.
 func TestAuthenticationLogoutWithRetainedCentralCookie(t *testing.T) {
 	for _, row := range []struct {
-		name   string // persisted cookie state for the withdrawal attempt
-		status int    // expected public logout response status
+		name          string // persisted cookie state for the withdrawal attempt
+		bearerStatus  int    // response when a legacy access token is also supplied
+		refreshStatus int    // response for refresh-only legacy withdrawal
 	}{
-		{"revoked", http.StatusOK},
-		{"expired", http.StatusOK},
-		{"live", http.StatusUnauthorized},
-		{"unknown", http.StatusUnauthorized},
+		{"revoked", http.StatusOK, http.StatusOK},
+		{"expired", http.StatusOK, http.StatusOK},
+		{"live", http.StatusUnauthorized, http.StatusForbidden},
+		{"unknown", http.StatusUnauthorized, http.StatusUnauthorized},
+		{"read_failure", http.StatusUnauthorized, http.StatusServiceUnavailable},
 	} {
-		t.Run(row.name, func(t *testing.T) {
-			fixture := newAuthenticationWithdrawalFixture(t)
-			now := time.Now().UTC()
-			switch row.name {
-			case "revoked":
-				fixture.store.session.RevokedAt = &now
-			case "expired":
-				fixture.store.session.ExpiresAt = now.Add(-time.Minute)
-			case "unknown":
-				fixture.store.readErr = identity.ErrCentralSessionExpired
-			}
-			refresh := identity.RefreshTokenPrefix + "withdrawal-fixture"
-			engine := gin.New()
-			engine.POST("/api/v1/auth/logout", fixture.handler.Logout)
-			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18182/api/v1/auth/logout", strings.NewReader(`{"refresh_token":"`+refresh+`"}`))
-			request.Header.Set("Content-Type", "application/json")
-			request.Header.Set("Origin", "http://127.0.0.1:18182")
-			request.Header.Set("Authorization", "Bearer "+fixture.token)
-			request.AddCookie(&http.Cookie{Name: centralTestSessionCookie, Value: fixture.secret})
-			response := httptest.NewRecorder()
-			engine.ServeHTTP(response, request)
-			require.Equal(t, row.status, response.Code)
-			if row.status == http.StatusOK {
-				require.Equal(t, []string{identity.HashToken(refresh)}, fixture.refresh.deletedHashes)
-			} else {
-				require.Empty(t, fixture.refresh.deletedHashes)
-			}
-			require.Empty(t, fixture.store.revokedUsers)
-		})
+		for _, credential := range []string{"access_and_refresh", "refresh_only"} {
+			t.Run(row.name+"/"+credential, func(t *testing.T) {
+				fixture := newAuthenticationWithdrawalFixture(t)
+				now := time.Now().UTC()
+				switch row.name {
+				case "revoked":
+					fixture.store.session.RevokedAt = &now
+				case "expired":
+					fixture.store.session.ExpiresAt = now.Add(-time.Minute)
+				case "unknown":
+					fixture.store.readErr = identity.ErrCentralSessionExpired
+				case "read_failure":
+					fixture.store.readErr = identity.ErrCentralUnavailable
+				}
+				refresh := identity.RefreshTokenPrefix + "withdrawal-fixture"
+				engine := gin.New()
+				engine.POST("/api/v1/auth/logout", fixture.handler.Logout)
+				request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18182/api/v1/auth/logout", strings.NewReader(`{"refresh_token":"`+refresh+`"}`))
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set("Origin", "http://127.0.0.1:18182")
+				status := row.refreshStatus
+				if credential == "access_and_refresh" {
+					request.Header.Set("Authorization", "Bearer "+fixture.token)
+					status = row.bearerStatus
+				}
+				request.AddCookie(&http.Cookie{Name: centralTestSessionCookie, Value: fixture.secret})
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, request)
+				require.Equal(t, status, response.Code)
+				if status == http.StatusOK {
+					require.Equal(t, []string{identity.HashToken(refresh)}, fixture.refresh.deletedHashes)
+				} else {
+					require.Empty(t, fixture.refresh.deletedHashes)
+				}
+				require.Empty(t, fixture.store.revokedUsers)
+			})
+		}
 	}
 }
 

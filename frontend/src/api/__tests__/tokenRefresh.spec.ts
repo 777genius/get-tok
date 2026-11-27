@@ -6,6 +6,13 @@ import axios from 'axios'
  * peer publication and session changes. Mocked HTTP responses, Web Locks and
  * timers reproduce delayed winners, rejection reconciliation, account
  * replacement and logout before a response can publish credentials.
+ *
+ * Authentication generations distinguish explicit replacements that retain the
+ * same storage values. Controlled promises expose the publication boundary and
+ * ensure an older attempt cannot occupy or clear a newer generation's shared
+ * slot. Web Lock fixtures also change ownership while the request waits, proving
+ * stale work is rejected before dispatch rather than relying on response checks
+ * alone. Peer refresh cases retain their cross-tab reconciliation behavior.
  */
 
 vi.mock('axios', () => ({
@@ -100,6 +107,58 @@ describe('refreshAuthTokens', () => {
     await expect(first).resolves.toMatchObject({ access_token: 'new-access' })
     await expect(second).resolves.toMatchObject({ refresh_token: 'new-refresh' })
     expect(localStorage.getItem('refresh_token')).toBe('new-refresh')
+  })
+
+  /**
+   * A session replacement keeps the same stored credentials while an earlier
+   * request waits. Its response cannot publish or clear the newer generation's flight.
+   */
+  it('separates generations even when user and refresh-token storage are unchanged', async () => {
+    seedSession()
+    const older = Promise.withResolvers<ReturnType<typeof refreshedResponse>>()
+    const newer = Promise.withResolvers<ReturnType<typeof refreshedResponse>>()
+    mockedPost.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise)
+    const { refreshAuthTokens } = await import('@/api/tokenRefresh')
+    const { replaceAuthentication } = await import('@/api/authenticationContext')
+
+    const obsolete = refreshAuthTokens()
+    const rejected = expect(obsolete).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' })
+    replaceAuthentication()
+    const current = refreshAuthTokens()
+    expect(current).not.toBe(obsolete)
+    expect(mockedPost).toHaveBeenCalledTimes(2)
+
+    older.resolve(refreshedResponse())
+    await rejected
+    expect(localStorage.getItem('auth_token')).toBe('old-access')
+    expect(localStorage.getItem('refresh_token')).toBe('old-refresh')
+    expect(refreshAuthTokens()).toBe(current)
+    newer.resolve(refreshedResponse())
+    await expect(current).resolves.toMatchObject({ refresh_token: 'new-refresh' })
+    expect(localStorage.getItem('auth_token')).toBe('new-access')
+  })
+
+  /**
+   * Ownership changes while the caller waits for an origin-wide Web Lock.
+   * The stale attempt must reject before reading peer credentials or dispatching HTTP.
+   */
+  it('rejects a replaced generation when its Web Lock is admitted', async () => {
+    seedSession()
+    const { refreshAuthTokens } = await import('@/api/tokenRefresh')
+    const { replaceAuthentication } = await import('@/api/authenticationContext')
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: vi.fn(async (_name: string, callback: () => Promise<unknown>) => {
+          replaceAuthentication()
+          return callback()
+        }),
+      },
+    })
+
+    await expect(refreshAuthTokens()).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' })
+    expect(mockedPost).not.toHaveBeenCalled()
+    expect(localStorage.getItem('refresh_token')).toBe('old-refresh')
   })
 
   /**

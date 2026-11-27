@@ -373,39 +373,49 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  // setAuthFromResponse publishes credentials and the authenticated user from a
-  // successful login response. The access token becomes reactive first, followed by an
-  // optional persisted refresh token and the user. Locale synchronization starts before
-  // access-token and user persistence, then pending authentication is cleared. Profile
-  // polling starts after storage updates, and token renewal is scheduled only when both
-  // refresh credentials and a nonzero relative expiry are supplied.
+  // setAuthFromResponse publishes a successful login under a new authentication generation.
+  // Callers must verify their request generation before entering this synchronous helper.
+  // The helper owns rollback after replacement because the caller still observes its
+  // earlier generation and must not clear a newer session. Fallible storage writes,
+  // pending-session cleanup, and timer setup remain inside that ownership boundary.
+  // Any publication failure clears partial credentials and timers only while this
+  // installed generation remains current, preserving a later replacement's authority.
   function setAuthFromResponse(response: AuthResponse): void {
     stopAutoRefresh()
     stopTokenRefresh()
-    replaceAuthentication()
-    centralEpoch = null
-    authMode.value = 'legacy'
-    refreshTokenValue.value = null
-    tokenExpiresAt.value = null
-    localStorage.removeItem(REFRESH_TOKEN_KEY)
-    localStorage.removeItem(TOKEN_EXPIRES_AT_KEY)
-    token.value = response.access_token
-    if (response.refresh_token) {
-      refreshTokenValue.value = response.refresh_token
-      localStorage.setItem(REFRESH_TOKEN_KEY, response.refresh_token)
-    }
+    const installedEpoch = replaceAuthentication()
+    try {
+      centralEpoch = null
+      authMode.value = 'legacy'
+      refreshTokenValue.value = null
+      tokenExpiresAt.value = null
+      localStorage.removeItem(REFRESH_TOKEN_KEY)
+      localStorage.removeItem(TOKEN_EXPIRES_AT_KEY)
+      token.value = response.access_token
+      if (response.refresh_token) {
+        refreshTokenValue.value = response.refresh_token
+        localStorage.setItem(REFRESH_TOKEN_KEY, response.refresh_token)
+      }
 
-    // Publish the response user before starting locale synchronization, then persist
-    // access credentials and clear the pending external authentication context.
-    const userData = response.user
-    user.value = userData
-    void syncUserLocale(userData)
-    localStorage.setItem(AUTH_TOKEN_KEY, response.access_token)
-    localStorage.setItem(AUTH_USER_KEY, JSON.stringify(userData))
-    clearPendingAuthSession()
-    startAutoRefresh()
-    if (response.refresh_token && response.expires_in) {
-      scheduleTokenRefresh(response.expires_in)
+      // Persist the response credentials before starting locale synchronization, so
+      // failed browser publication does not apply preferences from an abandoned session.
+      const userData = response.user
+      user.value = userData
+      localStorage.setItem(AUTH_TOKEN_KEY, response.access_token)
+      localStorage.setItem(AUTH_USER_KEY, JSON.stringify(userData))
+      clearPendingAuthSession()
+      startAutoRefresh()
+      if (response.refresh_token && response.expires_in) {
+        scheduleTokenRefresh(response.expires_in)
+      }
+      void syncUserLocale(userData)
+    } catch (error) {
+      // Publication may fail after ownership advances, so the publishing generation
+      // must clear its own partial session before returning the storage error.
+      if (authenticationEpoch() === installedEpoch) {
+        clearAuth({ preservePendingAuthSession: pendingAuthSession.value !== null })
+      }
+      throw error
     }
   }
 
@@ -612,8 +622,9 @@ export const useAuthStore = defineStore('auth', () => {
       try {
         await restoreCentralSession()
       } catch (error) {
-        const status = (error as { status?: number }).status
-        if (status !== 401 && status !== 404) throw error
+        const { status, code } = error as { status?: number; code?: string }
+        const disabled = status === 503 && code === 'CENTRAL_DISABLED'
+        if (status !== 401 && status !== 404 && !disabled) throw error
       }
     })()
     initialization = attempt

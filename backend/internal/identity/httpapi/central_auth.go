@@ -25,8 +25,10 @@ import (
 // frontend session bootstrap exposes the existing local profile and a separate
 // CSRF secret, both under no-store response policy.
 //
-// Cookie authentication is selected before legacy Bearer authentication, and
-// mixed credentials are rejected. Protected reads and mutations require the
+// A live or unobserved central cookie precedes legacy Bearer authentication,
+// and mixed credentials are rejected. A durably revoked or expired cookie
+// permits an explicit legacy Bearer to reach its existing guard.
+// Protected reads and mutations require the
 // session's CSRF secret, preventing another tab's cookie from silently changing
 // the displayed owner. Mutations also require the configured exact origin;
 // the dedicated session bootstrap permits the initial proof-free same-origin read.
@@ -309,7 +311,7 @@ func (h *CentralHandler) Wrap(legacy gin.HandlerFunc, administrator bool) gin.Ha
 		// An explicit legacy credential can follow a completed central logout.
 		// Only a durable inert-cookie observation permits that selection; unknown,
 		// live or unavailable session state cannot silently downgrade authentication.
-		if h.allowsLegacyCookieFallback(c) {
+		if c.GetHeader("Authorization") != "" && h.hasInertCookie(c) {
 			legacy(c)
 			return
 		}
@@ -370,16 +372,17 @@ func (h *CentralHandler) HasCookie(c *gin.Context) bool {
 	return false
 }
 
-// allowsLegacyCookieFallback permits explicit legacy credentials beside a
-// retained cookie only after storage confirms that session is revoked or
-// expired. Middleware and public logout share this selection rule, so a
-// completed central logout cannot redirect subsequent legacy withdrawal into
-// the wrong handler. Missing cookies, unknown rows, read failures and live
-// sessions never establish this fallback. The selected legacy handler retains
-// its own credential and current-account checks; this decision grants no
-// authentication or product authority.
-func (h *CentralHandler) allowsLegacyCookieFallback(c *gin.Context) bool {
-	if h.Flow == nil || c.GetHeader("Authorization") == "" {
+// hasInertCookie reports whether storage confirms that a retained central
+// cookie names a revoked or expired session. Missing cookies, unknown rows,
+// read failures and live sessions cannot establish that observation.
+//
+// Authentication middleware still requires an explicit legacy Authorization
+// header before selecting its existing credential checks. Public logout uses
+// the same durable observation to preserve optional refresh-token withdrawal
+// without requiring an access token. This decision grants no authentication
+// or product authority, and a disabled flow cannot establish an inert session.
+func (h *CentralHandler) hasInertCookie(c *gin.Context) bool {
+	if h.Flow == nil {
 		return false
 	}
 	raw, err := h.readCookie(c, false)
@@ -415,14 +418,15 @@ func (h *CentralHandler) authenticate(c *gin.Context) (identity.CentralAuthentic
 	return verified, true
 }
 
-// enabled reports whether the startup composition supplied a shared
-// authentication flow. A disabled flow writes an unavailable response instead
-// of selecting legacy credentials for an already central cookie.
+// enabled reports whether startup supplied a shared authentication flow.
+// A disabled flow returns the explicit CENTRAL_DISABLED code, allowing browser
+// startup to distinguish a disabled capability from an enabled service outage.
+// Requests carrying a central cookie still remain on this handler's refusal path.
 func (h *CentralHandler) enabled(c *gin.Context) bool {
 	if h.Flow != nil {
 		return true
 	}
-	centralHTTPError(c, identity.ErrCentralUnavailable)
+	AbortWithError(c, http.StatusServiceUnavailable, "CENTRAL_DISABLED", "Shared identity is disabled")
 	return false
 }
 

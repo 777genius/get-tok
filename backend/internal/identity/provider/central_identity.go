@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -12,8 +13,9 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	identityv1 "github.com/agent-teams-ai/identity/packages/contracts/gen/go/identity/v1"
+	"github.com/agent-teams-ai/identity/packages/contracts/gen/go/identity/v1"
 	"github.com/agent-teams-ai/identity/packages/contracts/gen/go/identity/v1/identityv1connect"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/TokenFlux/TokenRouter/internal/identity"
@@ -30,6 +32,14 @@ import (
 // rejects unknown enums and malformed timestamps instead of silently accepting
 // protocol defaults. A short workload-token cache reduces repeated token grants;
 // its deadline is independent of account-status and human-proof acceptance.
+// Concurrent cache misses share one bounded refresh, while each caller retains
+// its own cancellation. Network operations never hold the cache mutex.
+
+const (
+	// centralAuthorityTimeout bounds RPC transport and shared workload refreshes
+	// independently of any individual browser request that may stop waiting.
+	centralAuthorityTimeout = 5 * time.Second
+)
 
 // CentralAuthorityOptions supplies validated service endpoints and one consumer workload.
 type CentralAuthorityOptions struct {
@@ -44,7 +54,8 @@ type CentralIdentityClient struct {
 	client     identityv1connect.IdentityServiceClient // generated version-pinned protocol client
 	http       *http.Client                            // no-redirect, finite-time credential transport
 	options    CentralAuthorityOptions                 // immutable validated endpoint and client configuration
-	mu         sync.Mutex                              // serializes workload grant refresh and cache publication
+	mu         sync.Mutex                              // protects workload cache reads and publication
+	refresh    singleflight.Group                      // shares one pending workload grant across cancellable callers
 	token      string                                  // in-memory workload access credential, never a human token
 	tokenUntil time.Time                               // conservative cache deadline before grant expiration
 }
@@ -54,7 +65,7 @@ type CentralIdentityClient struct {
 // redirects are not followed, and loopback HTTP is reserved for the explicit
 // TEST configuration.
 func NewCentralIdentityClient(options CentralAuthorityOptions) *CentralIdentityClient {
-	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Timeout: centralAuthorityTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return &CentralIdentityClient{options: options, http: client, client: identityv1connect.NewIdentityServiceClient(client, options.BaseURL, connect.WithReadMaxBytes(65536))}
 }
 
@@ -99,36 +110,79 @@ func (c *CentralIdentityClient) GetAccountStatus(ctx context.Context, account id
 	return status, err
 }
 
-// workloadCredential obtains and briefly caches a dedicated client-credentials
-// grant under a mutex shared by callers. Refresh failure never selects an
-// expired token or the human client. The cache deadline starts before the
-// request so network time consumes the existing budget; it is capped at one
-// minute and at least five seconds before reported provider expiry. This
-// deadline governs token transport only and cannot extend account-status
-// evidence or an authenticated browser session.
+// workloadCredential returns a live cached workload token or waits for one
+// shared refresh. Each caller can stop waiting through its own context; that
+// cancellation does not interrupt the bounded service-owned grant needed by
+// other callers. Concurrent waiters receive the same refresh failure without
+// taking turns making additional grants. Successful waiters check the cache
+// deadline again before using its token, so scheduling delay cannot resurrect
+// an expired credential or extend any human authentication evidence.
 func (c *CentralIdentityClient) workloadCredential(ctx context.Context) (string, error) {
+	if ctx.Err() != nil {
+		return "", identity.ErrCentralUnavailable
+	}
+	if token := c.cachedWorkloadCredential(); token != "" {
+		return token, nil
+	}
+	// The refresh owns its timeout separately from every waiter. Cancellation of
+	// the first browser request must not abort another caller's pending grant.
+	result := c.refresh.DoChan("workload", func() (any, error) { return nil, c.refreshWorkloadCredential() })
+	select {
+	case <-ctx.Done():
+		return "", identity.ErrCentralUnavailable
+	case refreshed := <-result:
+		if refreshed.Err != nil || ctx.Err() != nil {
+			return "", identity.ErrCentralUnavailable
+		}
+		if token := c.cachedWorkloadCredential(); token != "" {
+			return token, nil
+		}
+		return "", identity.ErrCentralUnavailable
+	}
+}
+
+// cachedWorkloadCredential reads the token and its deadline under one short
+// lock. An absent or expired entry returns an empty string; it never starts
+// network work or waits for a pending refresh.
+func (c *CentralIdentityClient) cachedWorkloadCredential() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	started := time.Now().UTC()
-	if c.token != "" && started.Before(c.tokenUntil) {
-		return c.token, nil
+	if c.token != "" && time.Now().Before(c.tokenUntil) {
+		return c.token
 	}
+	return ""
+}
+
+// refreshWorkloadCredential obtains one dedicated client-credentials grant and
+// publishes it only after validating the complete response. The shared flight
+// rechecks the cache because another flight may finish after a caller's initial
+// miss. Its five-second context bounds request and body reads independently of
+// browser cancellation. The cache deadline starts before the request, is capped
+// at one minute, and leaves at least five seconds before provider expiration;
+// network time consumes that budget and failure never selects stale evidence.
+func (c *CentralIdentityClient) refreshWorkloadCredential() error {
+	if c.cachedWorkloadCredential() != "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), centralAuthorityTimeout)
+	defer cancel()
+	started := time.Now().UTC()
 	form := url.Values{"grant_type": {"client_credentials"}, "scope": {"identity.status:read"}}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.options.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", identity.ErrCentralUnavailable
+		return identity.ErrCentralUnavailable
 	}
 	request.SetBasicAuth(url.QueryEscape(c.options.WorkloadClientID), url.QueryEscape(c.options.WorkloadClientSecret))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
 	response, err := c.http.Do(request)
 	if err != nil {
-		return "", identity.ErrCentralUnavailable
+		return identity.ErrCentralUnavailable
 	}
 	defer func() { _ = response.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(response.Body, 65537))
 	if err != nil || response.StatusCode != http.StatusOK || len(data) > 65536 {
-		return "", identity.ErrCentralUnavailable
+		return identity.ErrCentralUnavailable
 	}
 	var grant struct {
 		AccessToken string `json:"access_token"` // confidential workload access grant
@@ -136,14 +190,19 @@ func (c *CentralIdentityClient) workloadCredential(ctx context.Context) (string,
 		ExpiresIn   int64  `json:"expires_in"`   // provider lifetime in seconds
 	}
 	if json.Unmarshal(data, &grant) != nil || grant.AccessToken == "" || len(grant.AccessToken) > 16384 || strings.ContainsAny(grant.AccessToken, " \t\r\n") || !strings.EqualFold(grant.TokenType, "Bearer") || grant.ExpiresIn <= 5 {
-		return "", identity.ErrCentralUnavailable
+		return identity.ErrCentralUnavailable
 	}
 	lifetime := min(grant.ExpiresIn-5, int64(60))
-	c.token, c.tokenUntil = grant.AccessToken, started.Add(time.Duration(lifetime)*time.Second)
-	if !time.Now().Before(c.tokenUntil) {
-		return "", identity.ErrCentralUnavailable
+	tokenUntil := started.Add(time.Duration(lifetime) * time.Second)
+	if !time.Now().Before(tokenUntil) {
+		return identity.ErrCentralUnavailable
 	}
-	return c.token, nil
+	// Publish the validated credential and conservative deadline together. Readers
+	// never observe a new token with the expiry of the preceding grant.
+	c.mu.Lock()
+	c.token, c.tokenUntil = grant.AccessToken, tokenUntil
+	c.mu.Unlock()
+	return nil
 }
 
 // centralStatus converts the generated observation without supplying defaults
@@ -227,11 +286,19 @@ func centralTimestamp(value *timestamppb.Timestamp, required bool) (time.Time, e
 
 // centralRPCError converts recognized protocol semantics to stable local
 // authentication errors without retaining server diagnostics. Explicit service
-// failures remain unavailable, while rejected or unknown authentication
-// evidence cannot grant access or trigger a legacy fallback.
+// failures and recognized interrupted transport reads remain unavailable.
+// Explicit credential rejections retain their denial category even when their
+// wrapped error resembles an I/O failure; unknown evidence still fails closed.
 func centralRPCError(err error) error {
-	if connect.CodeOf(err) == connect.CodeUnavailable || connect.CodeOf(err) == connect.CodeDeadlineExceeded || connect.CodeOf(err) == connect.CodeResourceExhausted || connect.CodeOf(err) == connect.CodeInternal {
+	code := connect.CodeOf(err)
+	if code == connect.CodeUnavailable || code == connect.CodeDeadlineExceeded || code == connect.CodeResourceExhausted || code == connect.CodeInternal {
 		return identity.ErrCentralUnavailable
+	}
+	if code == connect.CodeUnknown {
+		_, networkFailure := errors.AsType[net.Error](err)
+		if networkFailure || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			return identity.ErrCentralUnavailable
+		}
 	}
 	if failure, ok := errors.AsType[*connect.Error](err); ok {
 		for _, detail := range failure.Details() {

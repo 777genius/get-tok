@@ -60,32 +60,50 @@ const { t } = useI18n() // Authentication message translation resolver.
 let active = true // Mounted callback navigation ownership.
 const errorKey = ref<CallbackError | null>(null) // Bounded visible failure category.
 
+// showFailure publishes a bounded error and preserves its reload-safe recovery route.
+// Only allowlisted identifiers reach this helper. Replacing the complete query and
+// fragment removes unexpected input without converting a failed callback into success.
+function showFailure(error: CallbackError): void {
+  errorKey.value = error
+  window.history.replaceState(
+    window.history.state,
+    '',
+    `${window.location.pathname}?error=${error}`,
+  )
+}
+
 // complete restores a server-confirmed session or displays a fixed recovery message.
-// It removes callback query material before any asynchronous request and rejects
-// unexpected parameters. Successful completion uses only the product-owned role for
-// the dashboard destination; callers cannot supply a redirect URL through this route.
+// It accepts either no query or one allowlisted error string, rejecting empty,
+// repeated, unexpected, or fragment input before any asynchronous request. Failures
+// retain only their bounded error in history so a reload cannot restore an unrelated
+// cookie and hide the failed flow. Successful completion uses only the product-owned
+// role for the dashboard destination; callers cannot supply a redirect URL here.
 async function complete(): Promise<void> {
   const reported = route.query.error
   const unexpected = Object.keys(route.query).some((key) => key !== 'error') || Boolean(route.hash)
-  window.history.replaceState(window.history.state, '', window.location.pathname)
-  if (reported || unexpected) {
-    errorKey.value =
+  if (Object.keys(route.query).length > 0 || unexpected) {
+    showFailure(
       !unexpected &&
-      typeof reported === 'string' &&
-      allowedErrors.some((value) => value === reported)
+        typeof reported === 'string' &&
+        allowedErrors.some((value) => value === reported)
         ? (reported as CallbackError)
-        : 'authentication_failed'
+        : 'authentication_failed',
+    )
     return
   }
+  window.history.replaceState(window.history.state, '', window.location.pathname)
   try {
     await auth.restoreCentralSession()
     if (active) await router.replace(auth.isAdmin ? '/admin/dashboard' : '/dashboard')
   } catch (error) {
     const status = (error as { status?: number }).status
-    errorKey.value =
-      status === 0 || (status !== undefined && status >= 500)
-        ? 'temporarily_unavailable'
-        : 'authentication_failed'
+    if (active) {
+      showFailure(
+        status === 0 || (status !== undefined && status >= 500)
+          ? 'temporarily_unavailable'
+          : 'authentication_failed',
+      )
+    }
   }
 }
 

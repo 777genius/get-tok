@@ -372,6 +372,11 @@ func GetGJSONBool(body string, path string) (bool, bool) {
 // compatibility afterward. The returned claims keep provider text for the HTTP
 // flow to reconcile with userinfo and select the issuer/subject identity.
 func OidcParseAndValidateIDToken(ctx context.Context, cfg OIDCOptions, idToken string, expectedNonce string) (*OidcIDTokenClaims, error) {
+	// Invalid local input must retain its original first error even when the
+	// provider is unavailable, so reject it before starting the JWKS request.
+	if _, _, err := oidcValidationInputs(cfg, idToken); err != nil {
+		return nil, err
+	}
 	jwks, err := OidcFetchJWKSet(ctx, cfg.JWKSURL)
 	if err != nil {
 		return nil, err
@@ -379,16 +384,18 @@ func OidcParseAndValidateIDToken(ctx context.Context, cfg OIDCOptions, idToken s
 	return oidcValidateIDTokenWithKeys(cfg, idToken, expectedNonce, jwks)
 }
 
-// oidcValidateIDTokenWithKeys applies the same verification policy to keys loaded
-// by either the compatibility transport or the bounded central-auth transport.
+// oidcValidateIDTokenWithKeys validates one ID token against keys loaded by
+// either OIDC transport. It applies the configured algorithm, issuer, audience
+// and clock leeway before returning claims to the owning authentication flow.
+//
+// Mandatory issuance and expiry preserve an ordered token lifetime even inside
+// the accepted clock leeway. A supplied nonce binds this token to its browser
+// attempt; multiple audiences additionally require the configured client as
+// authorized party. Transport selection cannot weaken those shared checks.
 func oidcValidateIDTokenWithKeys(cfg OIDCOptions, idToken string, expectedNonce string, jwks *OidcJWKSet) (*OidcIDTokenClaims, error) {
-	idToken = strings.TrimSpace(idToken)
-	if idToken == "" {
-		return nil, errors.New("missing id_token")
-	}
-	allowed := OidcAllowedSigningAlgs(cfg.AllowedSigningAlgs)
-	if len(allowed) == 0 {
-		return nil, errors.New("empty allowed signing algorithms")
+	idToken, allowed, err := oidcValidationInputs(cfg, idToken)
+	if err != nil {
+		return nil, err
 	}
 
 	// Convert the settings reader's seconds into JWT time-validation leeway.
@@ -438,6 +445,21 @@ func oidcValidateIDTokenWithKeys(cfg OIDCOptions, idToken string, expectedNonce 
 		}
 	}
 	return claims, nil
+}
+
+// oidcValidationInputs returns the trimmed token and configured signing
+// algorithms. It reports a missing token before an empty algorithm set so
+// transports can reject local input before contacting the provider's JWKS.
+func oidcValidationInputs(cfg OIDCOptions, idToken string) (string, []string, error) {
+	idToken = strings.TrimSpace(idToken)
+	if idToken == "" {
+		return "", nil, errors.New("missing id_token")
+	}
+	allowed := OidcAllowedSigningAlgs(cfg.AllowedSigningAlgs)
+	if len(allowed) == 0 {
+		return "", nil, errors.New("empty allowed signing algorithms")
+	}
+	return idToken, allowed, nil
 }
 
 // OidcAllowedSigningAlgs returns trimmed uppercase algorithm names in first-seen

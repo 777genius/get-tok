@@ -46,11 +46,13 @@
 
 生产 cookie 为 `__Host-gettok-central` 和 `__Host-gettok-central-login`，带 `Secure`、`HttpOnly`、`SameSite=Lax`、`Path=/` 且无 Domain。loopback TEST 使用不同名称 `gettok-central-test` 与 `gettok-central-login-test`。认证响应使用 `Cache-Control: no-store`。opaque session 与 legacy Bearer 同时出现时拒绝混合身份；只有数据库确认该 cookie 已撤销或过期后，显式的 legacy Bearer 才能进入既有校验，已中央管理的用户仍会被拒绝。
 
+公开的 `POST /api/v1/auth/logout` 保留旧的可选 `refresh_token` payload，不要求 access token。浏览器仍带有 central cookie 时，只有数据库确认该 session 已撤销或过期，才交给旧 handler 撤销 refresh token；活动 session、未知 cookie 和数据库读取失败继续走 central proof 检查，不进入旧凭据撤销路径。这个选择不授予账户访问权限。
+
 central 模式的前端把 CSRF 只保存在内存，并在所有已认证请求上发送 `X-CSRF-Token`，包括 GET。受保护路由缺少或带错 proof 都返回 403，避免另一个标签页替换 cookie 后，旧页面把新账户的数据放入旧用户界面。写请求还必须通过 Origin 检查。专用的 `/central/session` bootstrap 可以不带 proof；若提供 proof，仍必须匹配。`/auth/me` 不能充当隐式 bootstrap。
 
 退出成功只提交撤销，不发删除 session cookie 的 `Set-Cookie`。这样延迟返回的旧退出请求不会清除另一次新登录的 cookie。已撤销 cookie 最迟随原 session 的 5 分钟绝对期限过期；网络或数据库错误时，前端保持可重试状态，不宣称已退出。全部 session 撤销只作用于本地 human sessions，API Key 和 MCP machine credentials 使用各自的生命周期。
 
-中央状态不可用或过期返回 503 `CENTRAL_UNAVAILABLE`；失效的身份或 session 返回 401；需要更强证明时返回 403 `CENTRAL_PROOF_REQUIRED`，有效的普通 session 不因此被删除。资源 owner、团队角色和余额规则继续由各产品模块决定。生产时限及恢复规则见[共享身份部署](../operations/shared_identity_deployment.md)。
+`/central/session` 在共享身份未启用时返回 503 `CENTRAL_DISABLED`，浏览器启动将这个明确的 capability 状态视为未登录。已启用服务的中央状态不可用或过期仍返回 503 `CENTRAL_UNAVAILABLE`，不能因此降级到旧登录；失效的身份或 session 返回 401；需要更强证明时返回 403 `CENTRAL_PROOF_REQUIRED`，有效的普通 session 不因此被删除。这里的错误码是 JSON 顶层的字符串 `code`。资源 owner、团队角色和余额规则继续由各产品模块决定。生产时限及恢复规则见[共享身份部署](../operations/shared_identity_deployment.md)。
 
 ## 全局入口
 

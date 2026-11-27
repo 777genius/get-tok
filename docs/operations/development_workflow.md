@@ -18,7 +18,7 @@
 
 | 工具 | 版本来源 | 当前要求 |
 | --- | --- | --- |
-| Go | `backend/go.mod`、CI | `1.27.3` |
+| Go | `backend/go.mod`、CI | `1.27.4` |
 | Node.js | `.node-version` | `26.12.1` |
 | pnpm | `frontend/package.json` 的 `packageManager` | `12.9.1`；本地 pnpm 读取该字段并切换到声明的版本 |
 | golangci-lint | `.golangci-version` | 本地和 CI 使用同一个完整版本，配置在 `backend/.golangci.yml` |
@@ -360,6 +360,12 @@ make build
 ```
 
 部署文件变更时执行 `make test-scripts` 和 `make test-installer`。依赖安全检查使用 `make security`，Security Scan workflow 分别调用它的 `security-go` 和 `security-frontend`。govulncheck 版本在 `.govulncheck-version` 固定，漏洞数据在线更新。前端审计的 stderr 原样输出；报告为空、包含错误对象或结构不完整时返回失败，高危漏洞按 `.github/audit-exceptions.yml` 核对例外与有效期。pnpm 按高危等级过滤漏洞明细，汇总仍包含低等级计数；脚本检查高危计数与明细是否一致。
+
+Go 最低版本为 `1.27.4`，修复 `net/http` 的 [GO-2026-6859](https://pkg.go.dev/vuln/GO-2026-6859)。依赖的安全版本下限为 Brotli `1.2.7`（[GO-2026-6888](https://pkg.go.dev/vuln/GO-2026-6888)）、klauspost/compress `1.20.2`（[GO-2026-6865](https://pkg.go.dev/vuln/GO-2026-6865)）和 OpenTelemetry core/SDK/trace `1.47.0`（[GO-2026-6974](https://pkg.go.dev/vuln/GO-2026-6974)、[GO-2026-6975](https://pkg.go.dev/vuln/GO-2026-6975)）。Gorilla WebSocket 使用 `v1.5.4-0.20240701034025-d67f41855da4`，固定到 [GO-2026-6278](https://pkg.go.dev/vuln/GO-2026-6278) 的上游修复提交；`v1.5.3` 仍受影响。后端、插件 SDK 和 Gemini 工具各自维护 Go 模块与校验和，更新时同步处理其中受影响的依赖，并通过正常 Go 模块解析生成 `go.sum`。
+
+插件 SDK 和 Gemini 工具的 `golang.org/x/net` 下限为 `0.62.0`，覆盖 [GO-2026-6866](https://pkg.go.dev/vuln/GO-2026-6866) 和 [GO-2026-6860](https://pkg.go.dev/vuln/GO-2026-6860)。Gemini 工具另将 gRPC 提升到 `1.83.2`，覆盖 [GO-2026-6443](https://pkg.go.dev/vuln/GO-2026-6443)、[GO-2026-6441](https://pkg.go.dev/vuln/GO-2026-6441) 和 [GO-2026-6348](https://pkg.go.dev/vuln/GO-2026-6348)，将 `golang.org/x/crypto` 固定为 [GO-2026-5932](https://pkg.go.dev/vuln/GO-2026-5932) 的修复版本 `v0.58.1-0.20261009181718-2f1f834330b2`；相关 `x/sys`、`x/text` 和协议依赖由 Go 的最小版本选择同步解析。
+
+`make security-go` 只扫描后端。插件 SDK 和 Gemini 工具需在各自模块目录运行同版本的 `govulncheck ./...` 与 `go test -mod=readonly ./...`，不能用后端扫描代替。模块级报告表示依赖版本受影响，并不证明代码调用了受影响的符号；更新后既要核对实际选中的模块图，也要验证独立模块的编译。插件 SDK 的进程握手测试需要允许本地 Unix 套接字，Gemini 工具的编译不需要真实提供商凭证。
 
 Vue 的最低版本为 `3.5.42`，该版本修复了 `@vue/server-renderer` 属性名检查中的 XSS 漏洞。`frontend/pnpm-workspace.yaml` 将低于 `1.2.2` 的 `source-map-js` 依赖提升到修复版本，覆盖 Vue 编译器和 i18n 引入的索引偏移 DoS 漏洞。更新这些依赖时同步维护锁文件，并运行前端测试、生产构建和安全扫描。
 

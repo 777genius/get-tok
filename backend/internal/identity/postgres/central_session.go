@@ -85,6 +85,27 @@ func (s *CentralSessionStore) ConsumeLogin(ctx context.Context, state, browser s
 	return flow, centralStoreError(err)
 }
 
+// HasBinding checks the exact authority and verified provider identity before
+// registration prepares new-account artifacts. An absent account returns false,
+// while a different issuer or subject remains an ownership conflict. This read
+// does not authorize a session: CompleteLogin repeats the binding decision under
+// its transaction lock, so deletion or replacement after this read fails closed.
+func (s *CentralSessionStore) HasBinding(ctx context.Context, account identity.CentralAccountReference, issuer, subject string) (bool, error) {
+	var storedIssuer, storedSubject string
+	err := s.db.QueryRowContext(ctx, `SELECT issuer,subject FROM central_identity_bindings
+ WHERE authority_incarnation=$1 AND account_id=$2`, account.AuthorityIncarnation, account.AccountID).Scan(&storedIssuer, &storedSubject)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, centralStoreError(err)
+	}
+	if storedIssuer != issuer || storedSubject != subject {
+		return false, identity.ErrCentralConflict
+	}
+	return true, nil
+}
+
 // CompleteLogin commits local ownership and the issued session in one transaction.
 // The account-reference lock serializes first registration; row and uniqueness
 // constraints separately protect prior local ownership and provider identity.

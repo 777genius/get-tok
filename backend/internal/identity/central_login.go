@@ -124,6 +124,11 @@ type CentralSessionStore interface {
 	// or ownership conflict cannot erase revocation that this process has already
 	// learned from the authority.
 	RecordAccountStatus(context.Context, CentralStatusEvidence) error
+	// HasBinding reports whether the exact authority account already belongs to
+	// this verified issuer and subject. A conflicting identity is rejected. This
+	// preflight only avoids repeated signup preparation; CompleteLogin must check
+	// ownership again inside its transaction before creating any session.
+	HasBinding(context.Context, CentralAccountReference, string, string) (bool, error)
 	// CompleteLogin commits local ownership, the sticky human-authentication fence
 	// and the new session together after rechecking current evidence. Existing
 	// bindings retain their local owner without repeating registration grants.
@@ -355,6 +360,9 @@ func (f *CentralFlow) Finish(ctx context.Context, state, browser, code string) (
 	if claims.ExpiresAt.Before(expires) {
 		expires = claims.ExpiresAt
 	}
+	// Floor the selected deadline once before both persistence representations are
+	// created. Keep the authority's original admission unchanged for later checks.
+	expires = expires.Truncate(time.Microsecond)
 	session := CentralSession{Digest: CentralSecretDigest(secret), CSRFSecret: csrf, LocalUserID: 1, Account: resolved.Status.Account, SecurityEpoch: resolved.Status.SecurityEpoch, AttachmentGeneration: resolved.Status.AttachmentGeneration, Admission: resolved.Admission, CreatedAt: now, ExpiresAt: expires}
 	if err := AuthorizeCentralSession(f.Options.Policy, session, resolved.Status, started, now, CentralAccessOrdinary); err != nil {
 		return CentralFinishResult{}, err
@@ -362,9 +370,17 @@ func (f *CentralFlow) Finish(ctx context.Context, state, browser, code string) (
 	completion := CentralLoginCompletion{Intent: intent, Issuer: claims.Issuer, Subject: claims.Subject, Status: resolved.Status, Session: session, Policy: f.Options.Policy, RequestStartedAt: started}
 	var plan AuthSignupGrantPlan
 	if intent.Intent == CentralIntentRegister {
-		completion.NewUser, completion.Artifacts, plan, err = f.prepareRegistration(ctx, intent, claims, info, resolved.Status.Account)
+		// A completed registration may have consumed its invitation before the
+		// browser lost the response. Only an unbound identity needs creation artifacts.
+		bound, err := f.Store.HasBinding(ctx, resolved.Status.Account, claims.Issuer, claims.Subject)
 		if err != nil {
 			return CentralFinishResult{}, err
+		}
+		if !bound {
+			completion.NewUser, completion.Artifacts, plan, err = f.prepareRegistration(ctx, intent, claims, info, resolved.Status.Account)
+			if err != nil {
+				return CentralFinishResult{}, err
+			}
 		}
 	}
 	committed, err := f.Store.CompleteLogin(ctx, completion)
@@ -470,7 +486,10 @@ func (f *CentralFlow) prepareRegistration(ctx context.Context, intent CentralLog
 			return nil, nil, AuthSignupGrantPlan{}, ErrCentralUnavailable
 		}
 		defaults, err := f.SignupDefaults(ctx)
-		if err != nil || defaults != nil && defaults.ForceEmailOnThirdPartySignup {
+		if err != nil {
+			return nil, nil, AuthSignupGrantPlan{}, ErrCentralUnavailable
+		}
+		if defaults != nil && defaults.ForceEmailOnThirdPartySignup {
 			return nil, nil, AuthSignupGrantPlan{}, ErrCentralProofRequired
 		}
 		encoded, err := json.Marshal(account)

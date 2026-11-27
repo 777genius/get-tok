@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -97,6 +98,39 @@ func TestCentralProtectedReadsRequireSessionProof(t *testing.T) {
 		} else {
 			require.Zero(t, profileReads)
 		}
+	}
+}
+
+// TestCentralSessionDistinguishesDisabledFromUnavailable exercises browser
+// bootstrap with a disabled flow and an enabled flow whose store fails.
+// Both return 503, but only the disabled capability has the CENTRAL_DISABLED code.
+func TestCentralSessionDistinguishesDisabledFromUnavailable(t *testing.T) {
+	for _, row := range []struct {
+		name    string // startup capability case name
+		enabled bool   // composition supplied a central flow
+		code    string // public response code discriminator
+	}{
+		{"disabled", false, "CENTRAL_DISABLED"},
+		{"unavailable", true, "CENTRAL_UNAVAILABLE"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			handler := &CentralHandler{Options: CentralHTTPOptions{Origin: "http://127.0.0.1:18182", TestLoopback: true}}
+			if row.enabled {
+				handler.Flow = &identity.CentralFlow{Store: &centralHTTPStoreProbe{readErr: identity.ErrCentralUnavailable}}
+			}
+			engine := gin.New()
+			engine.GET("/api/v1/auth/central/session", handler.Session)
+			request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:18182/api/v1/auth/central/session", nil)
+			request.AddCookie(&http.Cookie{Name: centralTestSessionCookie, Value: strings.Repeat("a", 64)})
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, http.StatusServiceUnavailable, response.Code)
+			var body struct {
+				Code string `json:"code"` // bounded public state discriminator
+			}
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+			require.Equal(t, row.code, body.Code)
+		})
 	}
 }
 

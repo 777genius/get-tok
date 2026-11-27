@@ -195,15 +195,17 @@ func (h *AuthenticationHandler) Login(c *gin.Context) { h.Session.Login(c) }
 // challenge and completes its account or pending binding.
 func (h *AuthenticationHandler) Login2FA(c *gin.Context) { h.Session.Login2FA(c) }
 
-// Logout selects central cookie withdrawal unless the same durable fallback
-// rule as authentication admits an explicit legacy credential. Legacy logout
-// keeps its existing optional refresh payload and pending-browser cleanup;
-// this dispatch does not add an access-token validation requirement.
+// Logout routes withdrawal to the legacy handler when no central cookie exists
+// or durable storage confirms that its session is revoked or expired.
+// Legacy logout accepts its optional refresh payload without an access token;
+// every live or unobserved central cookie retains the central proof checks.
 func (h *AuthenticationHandler) Logout(c *gin.Context) {
-	if h.Central != nil && h.Central.HasCookie(c) && !h.Central.allowsLegacyCookieFallback(c) {
+	if h.Central != nil && h.Central.HasCookie(c) && !h.Central.hasInertCookie(c) {
 		h.Central.Logout(c)
 		return
 	}
+	// The legacy handler owns optional refresh decoding and pending cleanup, so
+	// selection leaves the request body untouched for that established contract.
 	h.Session.Logout(c)
 }
 

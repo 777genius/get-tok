@@ -158,6 +158,7 @@ try {
     (value) => value.name === 'gettok-central-test',
   )
   assert.ok(cookie?.httpOnly && cookie.sameSite === 'Lax' && cookie.path === '/')
+  assert.ok(cookie.expires > 0, 'Central authentication requires an explicit cookie expiry')
   assert.ok(cookie.expires * 1000 <= Date.parse(session.expires_at) + 1000)
   await verifyStorage(page, session, cookie)
   await page.getByRole('button', { name: 'User menu', exact: true }).waitFor({ state: 'visible' })

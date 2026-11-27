@@ -1,19 +1,22 @@
 import axios from 'axios'
 import type { ApiResponse } from '@/api/common.types'
 import { buildApiUrl } from './url'
+import { authenticationEpoch, assertAuthenticationEpoch } from './authenticationContext'
 
 /**
  * tokenRefresh.ts rotates browser authentication tokens and reconciles refreshes
  * shared by calls and tabs. Each attempt captures the refresh token and user
- * identity before waiting, and stored replacement tokens are usable only while
- * their expiry and identity still match the attempt. The shared promise
- * coalesces calls within this document.
+ * identity and authentication generation before waiting, and stored replacement
+ * tokens are usable only while their expiry, identity, and generation still match
+ * the attempt. The shared promise coalesces calls within the same generation.
  *
  * Web Locks serialize refresh requests across participating tabs. Browsers
  * without that coordination can race on a refresh token, so a rejected request
  * waits for the winning tab to publish its pair. Publication writes access token
  * and expiry before refresh token, which acts as the completion marker. A logout
- * or changed user prevents an old response from restoring that session.
+ * or changed user prevents an old response from restoring that session. Generation
+ * checks also reject delayed responses after an explicit replacement that retains
+ * the same stored user and refresh token, including callback token adoption.
  */
 
 /**
@@ -98,6 +101,7 @@ export interface RefreshAuthTokensOptions {
  * its starting session.
  */
 interface AuthSnapshot {
+  epoch: number // Captured document authentication generation.
   accessToken: string | null // Captured access token.
   /**
    * The captured refresh token identifies the starting session and is compared
@@ -117,10 +121,13 @@ interface AuthSnapshot {
 }
 
 /**
- * inFlightRefresh holds the current document's shared rotation promise until
- * that exact attempt settles.
+ * inFlightRefresh holds one generation's shared rotation promise until that exact
+ * attempt settles. A replacement generation starts independently of obsolete work.
  */
-let inFlightRefresh: Promise<RefreshTokenResponse> | null = null
+let inFlightRefresh: {
+  epoch: number // Shared authentication generation.
+  promise: Promise<RefreshTokenResponse> // Generation-owned rotation result.
+} | null = null
 
 /**
  * getStoredUserID reads the numeric identity from the serialized browser user.
@@ -152,17 +159,19 @@ function getStoredUserID(): number | null {
 }
 
 /**
- * readAuthSnapshot captures the current credentials, expiry and parsed user
- * identifier. A missing refresh token rejects the attempt immediately; other
+ * readAuthSnapshot captures the current credentials, expiry, generation and parsed
+ * user identifier. A missing refresh token rejects the attempt immediately; other
  * fields retain their stored or parsed values for subsequent checks.
  */
-function readAuthSnapshot(): AuthSnapshot {
+function readAuthSnapshot(epoch: number): AuthSnapshot {
+  assertAuthenticationEpoch(epoch)
   const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY)
   if (!refreshToken) {
     throw new Error('No refresh token available')
   }
 
   return {
+    epoch,
     accessToken: localStorage.getItem(AUTH_TOKEN_KEY),
     refreshToken,
     expiresAt: Number(localStorage.getItem(TOKEN_EXPIRES_AT_KEY)),
@@ -172,13 +181,16 @@ function readAuthSnapshot(): AuthSnapshot {
 
 /**
  * readStoredTokenPair returns currently stored credentials that belong to the
- * snapshot's user and have a future finite expiry. It returns null when either
+ * snapshot's user and have a future finite expiry. The snapshot must still own
+ * this document's authentication generation before any stored pair is considered.
+ * It returns null when either
  * token is missing, the expiry is invalid or expired, or the parsed user
  * identity differs. Remaining lifetime is rounded upward to seconds and bounded
  * at one, allowing a peer result to use the same response shape as a refresh
  * response.
  */
 function readStoredTokenPair(snapshot: AuthSnapshot): RefreshTokenResponse | null {
+  assertAuthenticationEpoch(snapshot.epoch)
   const accessToken = localStorage.getItem(AUTH_TOKEN_KEY)
   const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY)
   const expiresAt = Number(localStorage.getItem(TOKEN_EXPIRES_AT_KEY))
@@ -284,7 +296,7 @@ function persistTokenPair(tokens: RefreshTokenResponse): void {
 /**
  * requestTokenPair exchanges the snapshot's refresh token and returns either its
  * validated response or a replacement published by a peer. Before persistence it
- * compares both the captured refresh token and parsed user ID, preventing an old
+ * verifies the captured generation, refresh token, and parsed user ID, preventing an old
  * response from repopulating a logged-out or changed session. An uncoordinated
  * 4xx loser waits through the original request timeout plus grace; other
  * failures receive a shorter reconciliation window before the original error is
@@ -307,6 +319,7 @@ async function requestTokenPair(
       { refresh_token: snapshot.refreshToken },
       { headers: { 'Content-Type': 'application/json' }, timeout: TOKEN_REFRESH_TIMEOUT_MS },
     )
+    assertAuthenticationEpoch(snapshot.epoch)
     const payload = response.data
     if (payload.code !== 0 || !payload.data) {
       throw new Error(payload.message || 'Token refresh failed')
@@ -324,12 +337,13 @@ async function requestTokenPair(
     }
 
     /**
-     * Publish only after token and user comparisons pass, preventing this
-     * delayed response from replacing credentials belonging to a newer session.
+     * Publish only after generation, token, and user comparisons pass, preventing
+     * a delayed response from replacing a session with otherwise identical storage.
      */
     persistTokenPair(payload.data)
     return payload.data
   } catch (error) {
+    assertAuthenticationEpoch(snapshot.epoch)
     /**
      * Uncoordinated 4xx rejection can precede the peer's successful response; allow
      * the shared deadline for publication, while other failures get a short
@@ -367,8 +381,11 @@ async function requestTokenPair(
  * qualifying pair before sending another request, while retaining the starting
  * snapshot for identity checks.
  */
-async function runRefresh(options: RefreshAuthTokensOptions): Promise<RefreshTokenResponse> {
-  const snapshot = readAuthSnapshot()
+async function runRefresh(
+  options: RefreshAuthTokensOptions,
+  epoch: number,
+): Promise<RefreshTokenResponse> {
+  const snapshot = readAuthSnapshot(epoch)
   /**
    * refresh checks for a peer-published pair before issuing the token exchange.
    * The flag tells requestTokenPair whether an uncoordinated competing tab may
@@ -395,33 +412,35 @@ async function runRefresh(options: RefreshAuthTokensOptions): Promise<RefreshTok
 
 /**
  * refreshAuthTokens returns the document's pending refresh or starts one through
- * runRefresh. Concurrent callers share the first attempt, including its captured
- * session and failed-token context, until that promise settles. Settlement
- * clears the slot only when it still points to that promise, so cleanup cannot
- * erase a later pending attempt. Cross-tab ordering and publication checks
- * remain owned by runRefresh and requestTokenPair, and failures are delivered
- * through the shared promise.
+ * runRefresh. Concurrent callers in the same generation share the first attempt,
+ * including its captured session and failed-token context, until that promise
+ * settles. A later generation cannot join an obsolete attempt even when stored
+ * credentials remain unchanged. Settlement clears the slot only when it still
+ * points to that promise, so cleanup cannot erase a later pending attempt.
+ * Cross-tab ordering and publication checks remain owned by runRefresh and
+ * requestTokenPair, and failures are delivered through the shared promise.
  */
 export function refreshAuthTokens(
   options: RefreshAuthTokensOptions = {},
 ): Promise<RefreshTokenResponse> {
-  if (inFlightRefresh) {
-    return inFlightRefresh
+  const epoch = authenticationEpoch()
+  if (inFlightRefresh?.epoch === epoch) {
+    return inFlightRefresh.promise
   }
 
-  const pending = runRefresh(options)
+  const pending = runRefresh(options, epoch)
   /**
    * Publish the attempt promise before returning it so concurrent callers join
    * the same refresh and observe the same outcome.
    */
-  inFlightRefresh = pending
+  inFlightRefresh = { epoch, promise: pending }
   /**
    * clearPending releases the shared slot when it still belongs to this settled
    * attempt. Both fulfillment and rejection use it so a subsequent refresh can
    * start after either outcome.
    */
   const clearPending = (): void => {
-    if (inFlightRefresh === pending) {
+    if (inFlightRefresh?.promise === pending) {
       inFlightRefresh = null
     }
   }

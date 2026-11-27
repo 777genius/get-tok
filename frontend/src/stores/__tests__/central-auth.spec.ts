@@ -1,12 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { useAuthStore } from '@/stores/auth'
+import axios from 'axios'
+import { refreshAuthTokens } from '@/api/tokenRefresh'
 import { centralTransport, replaceAuthentication } from '@/api/authenticationContext'
 
 // central-auth.spec.ts exercises cookie-session publication, expiration, and competing
 // authentication completions through the production store. Controlled endpoint promises
 // expose races while fake time keeps the server's absolute deadline observable without
 // issuing a real identity credential or replacing the backend E2E qualification.
+//
+// The same store also owns legacy callback adoption, whose generation can change
+// while its refresh-token storage stays intact. A delayed HTTP response exercises
+// the real refresh coordinator at that boundary and must not overwrite the
+// callback's credential. Bootstrap fixtures distinguish a deliberately disabled
+// central capability from an enabled but unavailable service; only the former
+// completes anonymous navigation through the existing route guard.
 
 // Endpoint spies control only external effects; the actual store owns timers, browser
 // storage, generation checks, and user publication throughout these scenarios.
@@ -71,11 +80,67 @@ beforeEach(() => {
 })
 afterEach(() => {
   store.$dispose()
+  vi.restoreAllMocks()
   vi.clearAllTimers()
   vi.useRealTimers()
 })
 
 describe('central browser session ownership', () => {
+  // A disabled capability is an ordinary anonymous startup outcome for legacy deployments.
+  // An enabled service outage remains observable rather than silently skipping central authentication.
+  it('distinguishes disabled Identity from enabled outages during bootstrap', async () => {
+    endpoints.session.mockRejectedValueOnce({ status: 503, code: 'CENTRAL_DISABLED' })
+    await expect(store.initializeSession()).resolves.toBeUndefined()
+    expect(store.isAuthenticated).toBe(false)
+
+    endpoints.session.mockRejectedValueOnce({ status: 503, code: 'CENTRAL_UNAVAILABLE' })
+    await expect(store.initializeSession()).rejects.toMatchObject({
+      status: 503,
+      code: 'CENTRAL_UNAVAILABLE',
+    })
+    expect(store.isAuthenticated).toBe(false)
+  })
+
+  // Legacy callback adoption advances ownership before loading its profile while retaining refresh storage.
+  // An earlier refresh must not publish through that real production transition.
+  it('rejects legacy refresh publication after setToken changes session ownership', async () => {
+    endpoints.login.mockResolvedValue({
+      access_token: 'legacy-access',
+      refresh_token: 'legacy-refresh',
+      expires_in: 3600,
+      user,
+    })
+    await store.login({ email: user.email, password: 'test-only' })
+    const response = {
+      data: {
+        code: 0,
+        data: {
+          access_token: 'obsolete-access',
+          refresh_token: 'obsolete-refresh',
+          expires_in: 3600,
+          token_type: 'Bearer',
+        },
+      },
+    }
+    const refresh = Promise.withResolvers<typeof response>()
+    vi.spyOn(axios, 'post').mockReturnValueOnce(refresh.promise)
+    const profile = Promise.withResolvers<{ data: typeof user }>()
+    endpoints.profile.mockReturnValueOnce(profile.promise)
+    const obsolete = refreshAuthTokens()
+    const rejected = expect(obsolete).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' })
+    const adopted = store.setToken('callback-access')
+    expect(localStorage.getItem('refresh_token')).toBe('legacy-refresh')
+    expect(localStorage.getItem('auth_user')).toBe(JSON.stringify(user))
+
+    refresh.resolve(response)
+    await rejected
+    expect(localStorage.getItem('auth_token')).toBe('callback-access')
+    expect(localStorage.getItem('refresh_token')).toBe('legacy-refresh')
+    profile.resolve({ data: user })
+    await expect(adopted).resolves.toEqual(user)
+    expect(store.token).toBe('callback-access')
+  })
+
   // A central callback replaces earlier legacy credentials with cookie transport.
   // Identity and CSRF state remain in memory, and background reads cannot extend expiry.
   it('keeps cookie authentication in memory and preserves the original deadline', async () => {
