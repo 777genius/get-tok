@@ -71,8 +71,16 @@ func TestRecoveryAuthenticationSecretsStayOutOfDiagnostics(t *testing.T) {
 					gin.DefaultErrorWriter = &ginOutput
 					t.Cleanup(func() { gin.DefaultErrorWriter = originalWriter })
 					var observed *gin.Context
+					var recoveryReturned, writtenAfterRecovery bool
 					router := gin.New()
-					router.Use(Recovery(), RequestLogger(), Logger())
+					router.Use(func(c *gin.Context) {
+						// Gin finalizes unwritten headers after the handler chain returns.
+						// Observe recovery before that engine-owned write, while preserving
+						// the production order of the three middleware under test.
+						c.Next()
+						recoveryReturned = true
+						writtenAfterRecovery = c.Writer.Written()
+					}, Recovery(), RequestLogger(), Logger())
 					router.GET("/api/v1/auth/central/callback", func(c *gin.Context) {
 						observed = c
 						panic(row.recovered)
@@ -84,13 +92,15 @@ func TestRecoveryAuthenticationSecretsStayOutOfDiagnostics(t *testing.T) {
 					request.Header.Set("X-Request-ID", canary+"-caller")
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, request)
+					require.True(t, recoveryReturned)
 					require.True(t, observed.IsAborted())
 					if row.broken {
-						require.False(t, observed.Writer.Written())
+						require.False(t, writtenAfterRecovery)
 						require.Empty(t, recorder.Body.String())
 						require.Len(t, observed.Errors, 1)
 						require.EqualError(t, observed.Errors[0].Err, "response connection closed")
 					} else {
+						require.True(t, writtenAfterRecovery)
 						require.Equal(t, http.StatusInternalServerError, recorder.Code)
 						require.Empty(t, observed.Errors)
 					}
