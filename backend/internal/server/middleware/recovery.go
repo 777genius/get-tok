@@ -104,7 +104,7 @@ func recoveryFrames() string {
 	n := runtime.Callers(3, pcs[:])
 	frames := runtime.CallersFrames(pcs[:n])
 	var trace strings.Builder
-	for range len(pcs) {
+	for range pcs {
 		frame, more := frames.Next()
 		// Builder writes cannot fail; frame metadata contains no request values.
 		_, _ = fmt.Fprintf(&trace, "%s %s:%d\n", frame.Function, frame.File, frame.Line)
