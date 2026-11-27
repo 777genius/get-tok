@@ -61,7 +61,7 @@ github.com/testcontainers/testcontainers-go/modules/redis modernc.org/sqlite`},
 github.com/agent-teams-ai/identity/packages/contracts/gen/go/identity/v1/identityv1connect
 github.com/hashicorp/go-plugin github.com/hashicorp/go-plugin/runner github.com/hashicorp/go-hclog
 google.golang.org/grpc/... google.golang.org/protobuf/... google.golang.org/genproto/googleapis/rpc/...
-github.com/shirou/gopsutil/v4/process golang.org/x/time/rate
+github.com/shirou/gopsutil/v4/process golang.org/x/sync/singleflight golang.org/x/time/rate
 golang.org/x/crypto/bcrypt github.com/ory/fosite github.com/ory/fosite/compose
 github.com/alibabacloud-go/captcha-20230305/client
 github.com/alibabacloud-go/darabonba-openapi/v2/utils github.com/alibabacloud-go/tea/dara
@@ -430,8 +430,14 @@ internal/upstream/zhipu/...`, Tests: ""},
 		{Scope: "internal/server", Imports: "internal/protocol/systemone", Files: "middleware/api_key_model_scenario_test.go"},
 		// OAuth registration hashes confidential-client secrets; revocation tests verify their authentication behavior.
 		{Scope: "internal/identity/provider", Imports: "golang.org/x/crypto/bcrypt", Files: "mcp_oauth_clients.go mcp_oauth_test.go"},
-		// The central authority adapter alone translates generated transport contracts into core policy.
-		{Scope: "internal", Imports: "connectrpc.com/connect github.com/agent-teams-ai/identity/packages/contracts/gen/go/identity/v1 github.com/agent-teams-ai/identity/packages/contracts/gen/go/identity/v1/identityv1connect", Files: "identity/provider/central_identity.go"},
+		// Central workload refreshes coalesce inside their owning provider adapter.
+		{Scope: "internal/identity/provider", Imports: "golang.org/x/sync/singleflight", Files: "central_identity.go"},
+		// The adapter and its boundary tests classify real Connect transport failures.
+		{Scope: "internal", Imports: "connectrpc.com/connect", Files: "identity/provider/central_identity.go identity/provider/central_identity_test.go"},
+		// The authority adapter and its real protocol tests consume the generated messages.
+		{Scope: "internal", Imports: "github.com/agent-teams-ai/identity/packages/contracts/gen/go/identity/v1", Files: "identity/provider/central_identity.go identity/provider/central_identity_test.go"},
+		// Only the production adapter constructs the generated authority client.
+		{Scope: "internal", Imports: "github.com/agent-teams-ai/identity/packages/contracts/gen/go/identity/v1/identityv1connect", Files: "identity/provider/central_identity.go"},
 		// Protocol acceptance uses migrated PostgreSQL and the production account reader on one connection pool.
 		{Scope: "internal/mcp/httpapi", Imports: "database/sql ent ent/runtime entgo.io/ent/dialect entgo.io/ent/dialect/sql github.com/modelcontextprotocol/go-sdk/auth github.com/modelcontextprotocol/go-sdk/oauthex internal/identity/postgres golang.org/x/oauth2", Files: "oauth_integration_test.go"},
 		// Creative's OpenAI adapter uses the shared native Images reader for mode

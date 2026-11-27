@@ -101,6 +101,77 @@ func TestCentralProtectedReadsRequireSessionProof(t *testing.T) {
 	}
 }
 
+// TestCentralBindingWithRetainedCookie reaches real legacy JWT validation only
+// after a durable inert-cookie observation. The fixture omits the independent
+// factor so an admitted bearer still cannot create a binding or transaction.
+func TestCentralBindingWithRetainedCookie(t *testing.T) {
+	for _, row := range []struct {
+		name       string // isolated browser binding admission scenario
+		cookie     string // configured durable central cookie state
+		enabled    bool   // explicit TEST binding profile is enabled
+		credential string // valid, absent or invalid legacy bearer
+		managed    bool   // legacy owner acquired the durable central fence
+		status     int    // expected response from the first refusing boundary
+		code       string // exact public failure category
+		userReads  int    // real JWT validation reached the current legacy owner
+	}{
+		{"no cookie", "", true, "valid", false, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", 1},
+		{"revoked", "revoked", true, "valid", false, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", 1},
+		{"expired", "expired", true, "valid", false, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", 1},
+		{"live", "live", true, "valid", false, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", 0},
+		{"unknown", "unknown", true, "valid", false, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", 0},
+		{"unavailable", "unavailable", true, "valid", false, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", 0},
+		{"profile disabled", "revoked", false, "valid", false, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", 0},
+		{"missing bearer", "revoked", true, "absent", false, http.StatusForbidden, "CENTRAL_PROOF_REQUIRED", 0},
+		{"invalid bearer", "revoked", true, "invalid", false, http.StatusUnauthorized, "INVALID_TOKEN", 0},
+		{"managed legacy owner", "revoked", true, "valid", true, http.StatusUnauthorized, "CENTRAL_LOGIN_REQUIRED", 1},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			fixture := newAuthenticationWithdrawalFixture(t)
+			handler := fixture.handler.Central
+			handler.Auth = fixture.handler.Session.authService
+			handler.Users = identity.NewUserService(fixture.users, nil, nil, nil, nil)
+			if row.enabled {
+				handler.Flow.Options.TestBindingProfile = identity.CentralTestBindingProfile
+			}
+			fixture.users.user.CentralManaged = row.managed
+			switch row.cookie {
+			case "revoked":
+				now := time.Now().UTC()
+				fixture.store.session.RevokedAt = &now
+			case "expired":
+				fixture.store.session.ExpiresAt = time.Now().Add(-time.Second)
+			case "unknown":
+				fixture.store.readErr = identity.ErrCentralSessionExpired
+			case "unavailable":
+				fixture.store.readErr = identity.ErrCentralUnavailable
+			}
+			engine := gin.New()
+			engine.POST("/api/v1/auth/central/start", handler.Start)
+			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18182/api/v1/auth/central/start", strings.NewReader(`{"intent":"bind"}`))
+			request.Header.Set("Origin", handler.Options.Origin)
+			if row.credential == "valid" {
+				request.Header.Set("Authorization", "Bearer "+fixture.token)
+			} else if row.credential == "invalid" {
+				request.Header.Set("Authorization", "Bearer invalid-credential")
+			}
+			if row.cookie != "" {
+				request.AddCookie(&http.Cookie{Name: centralTestSessionCookie, Value: fixture.secret})
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, row.status, response.Code)
+			var body struct {
+				Code string `json:"code"` // first refusing authentication boundary
+			}
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+			require.Equal(t, row.code, body.Code)
+			require.Equal(t, row.userReads, fixture.users.reads)
+			require.Empty(t, response.Header().Values("Set-Cookie"))
+		})
+	}
+}
+
 // TestCentralSessionDistinguishesDisabledFromUnavailable exercises browser
 // bootstrap with a disabled flow and an enabled flow whose store fails.
 // Both return 503, but only the disabled capability has the CENTRAL_DISABLED code.

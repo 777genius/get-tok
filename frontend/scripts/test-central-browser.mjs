@@ -2,18 +2,20 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
-import { chromium } from 'playwright'
+import { chromium, request } from 'playwright'
 
 // test-central-browser.mjs qualifies the built GetTok authentication interface against
 // the real loopback BFF, Keycloak, Identity service, and PostgreSQL fixture. The browser
-// obtains its own cookie through the rendered sign-in flow; no provider response,
-// authentication endpoint, or cookie is mocked or injected by this runner.
+// obtains its own cookie through the rendered sign-in flow; provider responses and
+// browser authentication endpoints are exercised without mocks or injected cookies.
 //
 // The surrounding Go fixture creates the product account before browser login and
 // later exercises central suspension with its separate session. This runner verifies
 // the frontend callback, memory-only authentication, restoration after reload, CSRF
-// rejection, and confirmed logout. Reports contain bounded outcomes and browser versions,
-// never authorization codes, cookie values, CSRF proofs, passwords, or provider tokens.
+// rejection, and confirmed logout. An isolated request context replays the captured
+// cookie and matching proof to distinguish server revocation from browser cookie deletion.
+// Reports contain bounded outcomes and browser versions, never authorization codes,
+// cookie values, CSRF proofs, passwords, or provider tokens.
 
 // required reads one explicit native prerequisite without including its value in errors.
 function required(name) {
@@ -206,18 +208,50 @@ try {
   await verifyStorage(page, restoredBody.data, cookie)
 
   phase = 'confirmed-logout'
-  const revoked = page.waitForResponse(
-    (value) =>
-      new URL(value.url()).pathname === '/api/v1/auth/central/logout' &&
-      value.request().method() === 'POST' &&
-      value.status() === 200,
+  const logoutCookie = (await context.cookies(origin)).find(
+    (value) => value.name === 'gettok-central-test',
   )
-  await page.getByRole('button', { name: 'User menu', exact: true }).click()
-  await page.getByRole('button', { name: 'Logout', exact: true }).click()
-  await revoked
-  await page.waitForURL((url) => url.origin === origin && url.pathname === '/login')
-  const denied = await context.request.get(`${origin}/api/v1/auth/me`)
-  assert.equal(denied.status(), 401)
+  assert.ok(logoutCookie, 'The restored session must still have its authentication cookie')
+  const replayHeaders = {
+    Cookie: `${logoutCookie.name}=${logoutCookie.value}`,
+    'X-CSRF-Token': restoredBody.data.csrf_token,
+  }
+  // Browser logout mutates its shared cookie jar. Keep a separate request context and
+  // prove the captured credential pair is admitted before requiring its later rejection.
+  const replay = await request.newContext({ timeout: 15_000, maxRedirects: 0 })
+  try {
+    const admitted = await replay.get(`${origin}/api/v1/auth/me`, { headers: replayHeaders })
+    assert.equal(admitted.status(), 200)
+    assert.equal((await admitted.json()).data.id, session.user.id)
+    const revoked = page.waitForResponse(
+      (value) =>
+        new URL(value.url()).pathname === '/api/v1/auth/central/logout' &&
+        value.request().method() === 'POST' &&
+        value.status() === 200,
+    )
+    await page.getByRole('button', { name: 'User menu', exact: true }).click()
+    await page.getByRole('button', { name: 'Logout', exact: true }).click()
+    await revoked
+    await page.waitForURL((url) => url.origin === origin && url.pathname === '/login')
+    const denied = await context.request.get(`${origin}/api/v1/auth/me`)
+    assert.equal(denied.status(), 401)
+
+    phase = 'revoked-cookie-replay'
+    // Keep the issued deadline live across replay so natural expiry during logout
+    // or navigation cannot substitute for evidence of explicit server revocation.
+    const replayDeadline = Date.parse(restoredBody.data.expires_at)
+    assert.ok(Date.now() < replayDeadline, 'The captured session must be unexpired before replay')
+    const replayed = await replay.get(`${origin}/api/v1/auth/me`, { headers: replayHeaders })
+    assert.equal(replayed.status(), 401)
+    assert.ok(
+      Date.now() < replayDeadline,
+      'The captured session must stay unexpired through replay',
+    )
+  } finally {
+    // The replay context owns response bodies and retained cookies independently of
+    // the browser. Dispose it even when an admission or revocation assertion fails.
+    await replay.dispose()
+  }
   assert.equal(
     pageErrors.length,
     0,

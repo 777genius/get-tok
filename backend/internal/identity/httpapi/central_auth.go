@@ -138,7 +138,9 @@ func (h *CentralHandler) Start(c *gin.Context) {
 	}
 	var owner *identity.CentralOwnerProof
 	if input.Intent == identity.CentralIntentBind {
-		if h.HasCookie(c) || h.Flow.Options.TestBindingProfile != identity.CentralTestBindingProfile {
+		// A retained cookie permits binding only after durable revocation or expiry.
+		// It cannot replace the legacy bearer, password or enrolled-factor checks below.
+		if h.Flow.Options.TestBindingProfile != identity.CentralTestBindingProfile || h.HasCookie(c) && !h.hasInertCookie(c) {
 			centralHTTPError(c, identity.ErrCentralBindingDisabled)
 			return
 		}
@@ -379,7 +381,8 @@ func (h *CentralHandler) HasCookie(c *gin.Context) bool {
 // Authentication middleware still requires an explicit legacy Authorization
 // header before selecting its existing credential checks. Public logout uses
 // the same durable observation to preserve optional refresh-token withdrawal
-// without requiring an access token. This decision grants no authentication
+// without requiring an access token. TEST binding still performs its complete
+// legacy-owner verification after this observation. This decision grants no authentication
 // or product authority, and a disabled flow cannot establish an inert session.
 func (h *CentralHandler) hasInertCookie(c *gin.Context) bool {
 	if h.Flow == nil {

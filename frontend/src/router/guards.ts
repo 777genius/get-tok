@@ -8,9 +8,10 @@ import { resolveCompletedSetupRedirectPath } from './setupRedirect'
 import { resolveRouteDocumentTitle } from './title'
 
 // guards.ts installs access checks, successful-navigation prefetching, and chunk-load
-// recovery on an application router. Session restoration runs once per installation
-// before authentication and role checks. Public settings are fetched for protected
-// feature routes when their availability is still unknown.
+// recovery on an application router. Session restoration precedes access checks and
+// retains successful initialization, with unexpected failures retried on later navigation.
+// The central callback owns its separate restoration flow. Public settings are fetched
+// for protected feature routes when their availability is still unknown.
 //
 // Loaded false feature flags redirect to the appropriate dashboard or settings page,
 // while failed settings reads leave those features accessible. Affiliate access
@@ -28,8 +29,8 @@ import { resolveRouteDocumentTitle } from './title'
 // navigation schedules prefetching, while chunk failures may reload the browser using a
 // session-scoped retry timestamp.
 export function installRouteGuards(router: Router): void {
-  // The installation owns one authentication-restoration marker and one lazy prefetch
-  // controller, preventing repeated startup work during subsequent navigation.
+  // The installation retains successful authentication restoration and one lazy prefetch
+  // controller. A temporary restoration failure leaves later navigation able to retry.
   let authInitialized = false
   let routePrefetch: ReturnType<typeof useRoutePrefetch> | null = null
   // Backend-mode general destinations use prefix matching, callbacks use exact matching,
@@ -85,22 +86,24 @@ export function installRouteGuards(router: Router): void {
 
   router.beforeEach(async (to, _from, next) => {
     const authStore = useAuthStore()
-    // Restore browser authentication before title and permission evaluation, then retain
-    // the initialization marker for later navigations on this router.
+    // Retain only successful restoration so a public-page visit during an outage cannot
+    // prevent a valid browser cookie from being restored on later protected navigation.
     if (!authInitialized) {
       // The central callback adopts its cookie itself, avoiding a competing bootstrap
       // request that could publish an earlier browser identity during completion.
       if (to.path !== '/auth/central/callback') {
         try {
           await authStore.initializeSession()
+          authInitialized = true
         } catch {
           if (to.meta.requiresAuth !== false) {
             next({ path: '/login', query: { error: 'temporarily_unavailable' } })
             return
           }
         }
+      } else {
+        authInitialized = true
       }
-      authInitialized = true
     }
     const appStore = useAppStore()
     const adminSettingsStore = useAdminSettingsStore()

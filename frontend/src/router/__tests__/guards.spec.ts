@@ -91,6 +91,41 @@ describe('application authentication guard', () => {
     expect(authStore.initializeSession).toHaveBeenCalledTimes(1)
   })
 
+  // A public page remains usable while session restoration temporarily fails.
+  // Later protected navigation retries restoration and admits the recovered cookie session.
+  it('retries restoration after an unavailable public-page initialization', async () => {
+    authStore.initializeSession
+      .mockRejectedValueOnce({ status: 503, code: 'CENTRAL_UNAVAILABLE' })
+      .mockImplementationOnce(() => {
+        authStore.isAuthenticated = true
+      })
+    const first = runGuard('/models')
+    await first.navigation
+    expect(first.next).toHaveBeenCalledExactlyOnceWith()
+
+    const recovered = runGuard('/dashboard')
+    await recovered.navigation
+    expect(recovered.next).toHaveBeenCalledExactlyOnceWith()
+
+    const later = runGuard('/dashboard')
+    await later.navigation
+    expect(later.next).toHaveBeenCalledExactlyOnceWith()
+    expect(authStore.initializeSession).toHaveBeenCalledTimes(2)
+  })
+
+  // The central callback owns session restoration before navigating to the dashboard.
+  // The guard must not introduce a competing bootstrap during or after that callback.
+  it('delegates central callback restoration without another bootstrap', async () => {
+    const callback = runGuard('/auth/central/callback')
+    await callback.navigation
+    expect(callback.next).toHaveBeenCalledExactlyOnceWith()
+    authStore.isAuthenticated = true
+    const dashboard = runGuard('/dashboard')
+    await dashboard.navigation
+    expect(dashboard.next).toHaveBeenCalledExactlyOnceWith()
+    expect(authStore.initializeSession).not.toHaveBeenCalled()
+  })
+
   // An unauthenticated protected-page visit still assigns its document title.
   // The resolved route title and current site name reach the browser before
   // redirect completion.

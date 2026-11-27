@@ -167,6 +167,43 @@ func TestCentralUsageReportsKeepPersonalScope(t *testing.T) {
 	require.Zero(t, repo.broadDashboardCalls)
 }
 
+// TestUsageReportsRejectNonpositiveKeySelectors checks list and summary requests
+// for legacy, ordinary central and organizational central credentials. A supplied
+// invalid key must fail before lookup or querying instead of widening the report.
+func TestUsageReportsRejectNonpositiveKeySelectors(t *testing.T) {
+	for _, credential := range []string{"legacy", "central personal", "central organizational"} {
+		t.Run(credential, func(t *testing.T) {
+			repo := &userUsageRepoCapture{}
+			handler := NewUsageHandler(usage.NewUsageService(repo), nil, nil, nil, timezone.NewCalendar(time.UTC))
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				kind := "jwt"
+				if credential != "legacy" {
+					kind = "central"
+				}
+				authctx.SetPrincipal(c, identity.Principal{UserID: 42, CredentialKind: kind}, 1, "fixture@example.invalid")
+				authctx.SetCentralAccess(c, func(class identity.CentralAccessClass) error {
+					if credential == "central personal" && class != identity.CentralAccessOrdinary {
+						return identity.ErrCentralProofRequired
+					}
+					return nil
+				})
+			})
+			router.GET("/usage", handler.List)
+			router.GET("/usage/stats", handler.Stats)
+			for _, key := range []string{"0", "-1"} {
+				for _, path := range []string{"/usage", "/usage/stats"} {
+					response := httptest.NewRecorder()
+					router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path+"?api_key_id="+key, nil))
+					require.Equal(t, http.StatusBadRequest, response.Code, path+"?api_key_id="+key)
+					require.Zero(t, repo.listFilters.UserID)
+					require.Zero(t, repo.statsFilters.UserID)
+				}
+			}
+		})
+	}
+}
+
 // TestCentralUsageRejectsUnscopedReadersAndStoredTeamDetails checks ordinary
 // sessions against readers without a personal contract and a stored team row.
 // Denial remains forbidden and leaves the browser's valid session cookie intact.

@@ -63,7 +63,8 @@ func (p *authenticationRefreshProbe) DeleteUserRefreshTokens(_ context.Context, 
 
 // GetByID supplies a fresh copy of the configured legacy owner for each call.
 // Changing its durable central-management flag after token issuance must reach
-// JWT validation before account-wide withdrawal proceeds.
+// JWT validation before account-wide withdrawal proceeds. The resolved flag
+// prevents profile hydration from applying the credential fingerprint twice.
 func (p *authenticationUserProbe) GetByID(_ context.Context, userID int64) (*identity.User, error) {
 	p.reads++
 	if userID != p.user.ID {
@@ -71,7 +72,15 @@ func (p *authenticationUserProbe) GetByID(_ context.Context, userID int64) (*ide
 	}
 	user := *p.user
 	user.TokenVersion = identity.ResolvedTokenVersion(&user)
+	user.TokenVersionResolved = true
 	return &user, nil
+}
+
+// GetUserAvatar leaves the authenticated fixture owner without profile imagery.
+// The real user service may hydrate that view while validating a legacy bearer;
+// no unrelated avatar repository behavior is needed for authentication admission.
+func (p *authenticationUserProbe) GetUserAvatar(context.Context, int64) (*identity.UserAvatar, error) {
+	return nil, nil
 }
 
 // newAuthenticationWithdrawalFixture constructs real dispatch and session

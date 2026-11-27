@@ -136,8 +136,8 @@ import DOMPurify from 'dompurify'
 //
 // Markdown rendering rewrites eligible relative image paths, sanitizes generated
 // HTML, adds heading identifiers, and installs local copy controls after rendering.
-// Request generations are checked after response and text reads, but the error
-// path and final copy-control pass retain their existing unconditional behavior.
+// Request generations and authentication epochs guard content and error publication
+// after asynchronous reads. The final copy-control pass remains unconditional.
 // Unmount cleanup releases the tracked scroll frame and theme observer; requests
 // and copy-feedback timeouts are not owned by that cleanup path.
 
@@ -285,9 +285,10 @@ let markdownGeneration = 0
 // and body reads discard older successful continuations before image rewriting
 // and heading extraction publish the resulting content.
 //
-// Failed reads retain the existing error publication path without a generation
-// check. The final block only gates loading completion, then waits for two render
-// ticks and installs copy controls regardless of which generation completed.
+// Failed reads publish translated errors only while their request generation and
+// authentication epoch remain current. The final block only gates loading completion,
+// then waits for two render ticks and installs copy controls regardless of which
+// generation completed.
 // Requests are not aborted by a replacement call or component unmount.
 async function fetchAndRenderMarkdown(slug: string) {
   const generation = ++markdownGeneration
@@ -348,8 +349,9 @@ async function fetchAndRenderMarkdown(slug: string) {
     renderedHtml.value = withIds
     tocItems.value = toc
   } catch {
-    // Fetching, decoding, or rendering failures replace the article with translated
-    // error markup; this catch also publishes after supersession because it has no generation guard.
+    // An older locale or authentication request can fail after replacement content is
+    // visible. Only the current owner may publish an error over that article.
+    if (generation !== markdownGeneration || authenticationEpoch() !== expectedSession) return
     renderedHtml.value = `<p class="text-red-500">${t('customPage.markdownLoadFailed')}</p>`
   } finally {
     if (generation === markdownGeneration) loading.value = false

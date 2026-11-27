@@ -263,7 +263,7 @@ func (h *UsageHandler) parseUserUsageFilters(c *gin.Context, requireRange bool) 
 	var apiKeyID int64
 	if apiKeyIDStr := strings.TrimSpace(c.Query("api_key_id")); apiKeyIDStr != "" {
 		id, err := strconv.ParseInt(apiKeyIDStr, 10, 64)
-		if err != nil {
+		if err != nil || id <= 0 {
 			response.BadRequest(c, "Invalid api_key_id")
 			return nil, false
 		}

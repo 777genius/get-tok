@@ -20,10 +20,12 @@ import (
 // fence. An email conflict cannot select an existing owner, and a previously
 // bound account cannot move to another user through a later login request.
 //
-// Status observations are merged while holding the binding row lock. Session
-// reads follow publication under that transaction, so a completed local logout
-// remains authoritative. Session evidence contains original counters and proof
-// bounds; only the revocation column changes later. Login state is consumed by
+// First binding and standalone status publication acquire the same account
+// lock before the binding row lock, retaining observations while ownership is
+// being committed. Session reads follow publication under that transaction, so
+// a completed local logout remains authoritative. Session evidence contains
+// original counters and proof bounds; only the revocation column changes later.
+// Login state is consumed by
 // one conditional update before provider exchange, and failure after consumption
 // requires a new browser transaction instead of restoring an old authorization.
 
@@ -107,8 +109,9 @@ func (s *CentralSessionStore) HasBinding(ctx context.Context, account identity.C
 }
 
 // CompleteLogin commits local ownership and the issued session in one transaction.
-// The account-reference lock serializes first registration; row and uniqueness
-// constraints separately protect prior local ownership and provider identity.
+// The account-reference lock serializes first binding with standalone status
+// publication; row and uniqueness constraints separately protect prior local
+// ownership and provider identity.
 //
 // Existing bindings retain their user ID and never receive signup grants again.
 // Test migration rechecks current password and factor state under the user lock.
@@ -124,12 +127,8 @@ func (s *CentralSessionStore) CompleteLogin(ctx context.Context, input identity.
 	defer func() { _ = tx.Rollback() }()
 	ctx = dbent.NewTxContext(ctx, tx)
 	client := tx.Client()
-	lockKey, err := json.Marshal(input.Status.Account)
-	if err != nil {
-		return identity.CentralLoginCommit{}, identity.ErrCentralEvidenceInvalid
-	}
-	if _, err := client.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,418731))`, string(lockKey)); err != nil {
-		return identity.CentralLoginCommit{}, identity.ErrCentralUnavailable
+	if err := centralLockAccount(ctx, client, input.Status.Account); err != nil {
+		return identity.CentralLoginCommit{}, err
 	}
 	var userID int64
 	var issuer, subject string
@@ -162,6 +161,12 @@ func (s *CentralSessionStore) CompleteLogin(ctx context.Context, input identity.
 			user, err := client.User.Query().Where(dbuser.IDEQ(proof.LocalUserID)).ForUpdate().Only(ctx)
 			if err != nil {
 				return identity.CentralLoginCommit{}, centralStoreError(err)
+			}
+			// Waiting for the user lock can consume the remaining proof lifetime.
+			// Recheck the same proof before activating its permanent ownership fence.
+			now = s.now().UTC()
+			if proof.VerifiedAt.After(now) || !now.Before(proof.VerifiedAt.Add(identity.CentralAdmissionBudget)) {
+				return identity.CentralLoginCommit{}, identity.ErrCentralProofRequired
 			}
 			current := UserFromEntity(user)
 			if !current.IsActive() || current.CentralManaged || !current.TotpEnabled || current.TotpEnabledAt == nil || current.TotpEnabledAt.IsZero() || current.TotpEnabledAt.After(proof.VerifiedAt) || identity.CentralOwnerFingerprint(current) != proof.CredentialFingerprint {
@@ -238,9 +243,10 @@ func (s *CentralSessionStore) ReadSession(ctx context.Context, digest string) (i
 }
 
 // RecordAccountStatus publishes an observation for an already bound account in
-// its own transaction. It locks the binding before merging revisions and
-// counters so a delayed callback cannot overwrite a newer denial. Unknown
-// accounts remain unbound rather than acquiring ownership through a read.
+// its own transaction. The shared account lock waits for any first binding to
+// commit before the binding row is read and locked. Revisions and counters then
+// merge without allowing a delayed callback to overwrite a newer denial.
+// Accounts still unbound after that wait acquire no ownership through a read.
 // Successful publication commits before later proof or registration checks;
 // rejection in those independent steps therefore cannot roll back a security
 // fence that this process has already observed.
@@ -253,6 +259,9 @@ func (s *CentralSessionStore) RecordAccountStatus(ctx context.Context, incoming 
 	// the independent login transaction can encounter another local-account error.
 	defer func() { _ = tx.Rollback() }()
 	client := tx.Client()
+	if err := centralLockAccount(ctx, client, incoming.Account); err != nil {
+		return err
+	}
 	var userID int64
 	var encoded []byte
 	err = centralScan(ctx, client, `SELECT local_user_id,status_evidence FROM central_identity_bindings
@@ -349,6 +358,23 @@ func (s *CentralSessionStore) RevokeSession(ctx context.Context, digest string, 
 func (s *CentralSessionStore) RevokeUserSessions(ctx context.Context, userID int64, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE central_identity_sessions SET revoked_at=COALESCE(revoked_at,$2) WHERE local_user_id=$1`, userID, now)
 	return centralStoreError(err)
+}
+
+// centralLockAccount serializes first ownership and standalone status publication.
+// Both callers acquire this transaction-scoped lock before any binding row lock,
+// using the same encoded authority account and namespace seed. Request cancellation
+// bounds a blocked query, and transaction completion releases the lock. Existing
+// session publication takes only binding and session row locks, so it introduces
+// no reverse dependency on this account lock.
+func centralLockAccount(ctx context.Context, query SQLExecutor, account identity.CentralAccountReference) error {
+	lockKey, err := json.Marshal(account)
+	if err != nil {
+		return identity.ErrCentralEvidenceInvalid
+	}
+	if _, err := query.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,418731))`, string(lockKey)); err != nil {
+		return identity.ErrCentralUnavailable
+	}
+	return nil
 }
 
 // centralReadSession checks lookup identity and timestamp columns against the

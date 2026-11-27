@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { replaceAuthentication } from '@/api/authenticationContext'
 import {
   createProviderTestRun,
   executeProviderTest,
@@ -6,14 +7,18 @@ import {
 } from '../providerTestRun'
 
 /**
- * providerTestRun.spec.ts checks image opt-in and immutable decision preview snapshots.
- * Local SSE fixtures complete real runner requests, allowing single and repeated batch-style
- * executions to be compared without calling a provider or relying on dialog layout.
+ * providerTestRun.spec.ts checks image opt-in, immutable preview snapshots, and response
+ * cancellation after authentication changes. Local SSE fixtures exercise the real runner
+ * without calling a provider; controlled reads distinguish unopened and active response bodies.
  */
 
-describe('decision image submission', () => {
-  afterEach(() => vi.unstubAllGlobals())
+beforeEach(() => replaceAuthentication())
+afterEach(() => {
+  replaceAuthentication()
+  vi.unstubAllGlobals()
+})
 
+describe('decision image submission', () => {
   // Two runs share an editable image draft and receive nullable-confidence Box answers.
   // Requests explicitly enable images while private preview metadata stays in independent run snapshots.
   it('sends image opt-in and snapshots images for each run', async () => {
@@ -88,5 +93,90 @@ describe('decision image submission', () => {
       t: (key) => key,
     })
     expect(fetch.mock.calls[0][1].headers).not.toHaveProperty('TypeSafe-Danger-Zone-Images')
+  })
+})
+
+describe('authentication-owned response cancellation', () => {
+  // A response arrives before its body reader is acquired, with unchanged or replaced authentication.
+  // Only a replaced session cancels the body; the original session still accepts its terminal event.
+  it.each([false, true])(
+    'cancels an unopened response only for replacement=%s',
+    async (replaced) => {
+      const cancel = vi.fn()
+      const response = new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode('data: {"type":"test_complete","success":true}\n'),
+            )
+            if (!replaced) controller.close()
+          },
+          cancel,
+        }),
+      )
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => {
+          if (replaced) replaceAuthentication()
+          return response
+        }),
+      )
+      const run = createProviderTestRun()
+      await executeProviderTest({
+        providerId: 1,
+        providerName: 'Fixture',
+        body: { model_id: 'fixture-model', test_type: 'text' },
+        run,
+        signal: new AbortController().signal,
+        t: (key) => key,
+      })
+      expect(cancel).toHaveBeenCalledTimes(replaced ? 1 : 0)
+      expect(run.status).toBe(replaced ? 'error' : 'success')
+      expect(run.replyText).toBe('')
+    },
+  )
+
+  // Authentication changes while the real stream reader waits for its next event.
+  // The stale event must remain unpublished and cancellation must release the still-open upstream body.
+  it('cancels the reader when authentication changes during a read', async () => {
+    const cancel = vi.fn()
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    let started!: () => void
+    const reading = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    // Demand-driven pulling signals when the runner actually waits in reader.read, so
+    // the session change cannot race ahead of acquiring that response's reader.
+    const response = new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          start(value) {
+            controller = value
+          },
+          pull() {
+            started()
+          },
+          cancel,
+        },
+        { highWaterMark: 0 },
+      ),
+    )
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response))
+    const run = createProviderTestRun()
+    const completion = executeProviderTest({
+      providerId: 1,
+      providerName: 'Fixture',
+      body: { model_id: 'fixture-model', test_type: 'text' },
+      run,
+      signal: new AbortController().signal,
+      t: (key) => key,
+    })
+    await reading
+    replaceAuthentication()
+    controller.enqueue(new TextEncoder().encode('data: {"type":"content","text":"stale"}\n'))
+    await completion
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(run.replyText).toBe('')
+    expect(run.status).toBe('error')
   })
 })

@@ -45,6 +45,42 @@ func TestLoadCentralIdentityRequiresPersistentEncryption(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, cfg.CentralIdentity.Enabled)
 	require.True(t, cfg.Totp.EncryptionKeyConfigured)
+	// Browser serialization removes default ports and numeric padding. Startup
+	// rejects those inputs while preserving ordinary and non-default TEST origins.
+	for _, row := range []struct {
+		origin  string // supplied browser-facing origin with otherwise valid inputs
+		allowed bool   // startup accepts the browser's canonical port representation
+	}{
+		{"https://gettok.example.invalid", true},
+		{"https://gettok.example.invalid:443", false},
+		{"https://gettok.example.invalid:0443", false},
+		{"https://gettok.example.invalid:8443", true},
+		{"https://gettok.example.invalid:08443", false},
+		{"https://gettok.example.invalid:65536", false},
+		{"http://127.0.0.1", true},
+		{"http://127.0.0.1:", false},
+		{"http://127.0.0.1:80", false},
+		{"http://127.0.0.1:0080", false},
+		{"http://127.0.0.1:18182", true},
+		{"http://[::1]:80", false},
+		{"http://[::1]:18182", true},
+	} {
+		t.Run(row.origin, func(t *testing.T) {
+			candidate := cfg.CentralIdentity
+			candidate.Origin = row.origin
+			if strings.HasPrefix(row.origin, "http:") {
+				candidate.TestLoopback = true
+				candidate.APIURL = "http://127.0.0.1:18183"
+				candidate.IssuerURL = "http://127.0.0.1:18184/realms/identity"
+			}
+			err := candidate.Validate()
+			if row.allowed {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "central_identity.origin")
+			}
+		})
+	}
 	cfg.CentralIdentity.APIURL += "?"
 	require.Error(t, cfg.CentralIdentity.Validate())
 	cfg.CentralIdentity.APIURL = "http://127.0.0.1:18183"

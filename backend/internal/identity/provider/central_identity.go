@@ -91,23 +91,53 @@ func (c *CentralIdentityClient) ResolveSelf(ctx context.Context, human, command 
 // GetAccountStatus uses a separate workload credential to read the exact
 // attached account reference. It rejects a contradictory returned reference,
 // and its evidence cannot renew the original session counters or human proof
-// deadline.
+// deadline. A rejected workload grant is discarded and acquired once more;
+// repeated workload authentication failure remains a service outage, not a
+// rejection of the browser's human session. Account denials are never retried.
 func (c *CentralIdentityClient) GetAccountStatus(ctx context.Context, account identity.CentralAccountReference) (identity.CentralStatusEvidence, error) {
-	credential, err := c.workloadCredential(ctx)
-	if err != nil {
-		return identity.CentralStatusEvidence{}, err
+	for range 2 {
+		credential, err := c.workloadCredential(ctx)
+		if err != nil {
+			return identity.CentralStatusEvidence{}, err
+		}
+		request := connect.NewRequest(&identityv1.GetAccountStatusRequest{Account: &identityv1.AccountReference{AccountId: account.AccountID, AuthorityIncarnation: account.AuthorityIncarnation}})
+		request.Header().Set("Authorization", "Bearer "+credential)
+		response, err := c.client.GetAccountStatus(ctx, request)
+		if err != nil {
+			if rejectedWorkloadCredential(err) {
+				c.discardWorkloadCredential(credential)
+				continue
+			}
+			return identity.CentralStatusEvidence{}, centralRPCError(err)
+		}
+		status, err := centralStatus(response.Msg.GetStatus())
+		if err == nil && status.Account != account {
+			err = identity.ErrCentralEvidenceInvalid
+		}
+		return status, err
 	}
-	request := connect.NewRequest(&identityv1.GetAccountStatusRequest{Account: &identityv1.AccountReference{AccountId: account.AccountID, AuthorityIncarnation: account.AuthorityIncarnation}})
-	request.Header().Set("Authorization", "Bearer "+credential)
-	response, err := c.client.GetAccountStatus(ctx, request)
-	if err != nil {
-		return identity.CentralStatusEvidence{}, centralRPCError(err)
+	return identity.CentralStatusEvidence{}, identity.ErrCentralUnavailable
+}
+
+// rejectedWorkloadCredential recognizes the protocol's bare authentication
+// refusal. PermissionDenied also represents a missing account or attachment,
+// and typed lifecycle details must retain their existing denial semantics even
+// under an unexpected status code. Unknown details are not treated as grants
+// to retry or weaken the account decision.
+func rejectedWorkloadCredential(err error) bool {
+	failure, ok := errors.AsType[*connect.Error](err)
+	return ok && failure.Code() == connect.CodeUnauthenticated && len(failure.Details()) == 0
+}
+
+// discardWorkloadCredential removes only the grant rejected by this request.
+// A delayed response for an earlier grant cannot erase a newer credential that
+// another caller already refreshed and published under the cache mutex.
+func (c *CentralIdentityClient) discardWorkloadCredential(rejected string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.token == rejected {
+		c.token, c.tokenUntil = "", time.Time{}
 	}
-	status, err := centralStatus(response.Msg.GetStatus())
-	if err == nil && status.Account != account {
-		err = identity.ErrCentralEvidenceInvalid
-	}
-	return status, err
 }
 
 // workloadCredential returns a live cached workload token or waits for one

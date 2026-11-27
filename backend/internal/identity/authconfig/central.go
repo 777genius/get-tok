@@ -3,6 +3,7 @@ package authconfig
 import (
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -41,7 +42,8 @@ type CentralIdentityConfig struct {
 // Validate checks deployment inputs only when shared authentication is
 // explicitly enabled. Human and workload clients must differ, and all
 // configured endpoints must be canonical HTTPS URLs outside the separately
-// named loopback TEST profile. Browser origin cannot contain a path, while
+// named loopback TEST profile. Browser origin cannot contain a path or a
+// noncanonical port, including an explicit scheme-default port, while
 // provider aliases are bounded and unique. The migration candidate is accepted
 // only in TEST mode; stronger organizational assurance deliberately has no
 // configuration switch that an unqualified returned claim could enable.
@@ -71,6 +73,17 @@ func (c CentralIdentityConfig) Validate() error {
 		}
 		if name == "origin" && u.Path != "" {
 			return fmt.Errorf("central_identity.origin must not contain a path")
+		}
+		if name == "origin" && strings.HasSuffix(u.Host, ":") {
+			return fmt.Errorf("central_identity.origin must not contain an empty port")
+		}
+		if name == "origin" && u.Port() != "" {
+			// Browsers remove default ports and leading zeroes before sending Host and
+			// Origin. Reject those configurations instead of changing exact issuer URLs.
+			port, err := strconv.ParseUint(u.Port(), 10, 16)
+			if err != nil || strconv.FormatUint(port, 10) != u.Port() || u.Scheme == "https" && port == 443 || u.Scheme == "http" && port == 80 {
+				return fmt.Errorf("central_identity.origin must use a canonical non-default port or omit it")
+			}
 		}
 	}
 	if c.TestBindingProfile != "" && (!c.TestLoopback || c.TestBindingProfile != "test-password-totp-v1") {
