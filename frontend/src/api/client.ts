@@ -17,7 +17,7 @@ import {
   assertAuthenticationEpoch,
   centralTransport,
   invalidateCentralTransport,
-  isCentralAuthenticationPath,
+  isCookieOnlyAuthenticationPath,
   type AuthenticationRequest,
 } from './authenticationContext'
 
@@ -85,8 +85,8 @@ apiClient.interceptors.request.use(
     }
     const central = centralTransport()
     config._authenticationEpoch = authenticationEpoch()
-    config._centralAuthentication = central !== null || isCentralAuthenticationPath(config.url)
-    // Central requests never borrow a stored legacy credential. Explicit migration
+    config._centralAuthentication = central !== null || isCookieOnlyAuthenticationPath(config.url)
+    // Cookie-only requests never borrow a stored legacy credential. Explicit migration
     // start alone carries that credential as proof of the existing product owner.
     if (config._centralAuthentication && !config.allowLegacyIdentityBinding) {
       config.headers.delete('Authorization')
@@ -205,7 +205,7 @@ apiClient.interceptors.response.use(
       // Entry-point errors remain on their form, and no central response falls
       // through to legacy bearer refresh or legacy credential cleanup below.
       if (!pluginResponse && status === 401 && originalRequest?._centralAuthentication) {
-        const entry = isCentralAuthenticationPath(url)
+        const entry = isCookieOnlyAuthenticationPath(url)
         if (
           (!entry || url === '/auth/central/session') &&
           originalRequest._authenticationEpoch !== undefined &&

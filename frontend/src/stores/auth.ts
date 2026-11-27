@@ -517,25 +517,20 @@ export const useAuthStore = defineStore('auth', () => {
     setPendingAuthSession(null)
   }
 
-  // logout revokes the currently captured session before clearing its local identity.
-  // Central revocation failures propagate for retry; legacy logout retains its historical
-  // best-effort behavior. Completion never clears a different session adopted meanwhile.
+  // logout withdraws the captured browser session before clearing its local identity.
+  // An adopted central session supplies its proof directly. Otherwise the generic server
+  // endpoint selects central or legacy withdrawal from the actual cookie, including while
+  // restoration is pending. Request failures remain observable for retry, so unknown cookie
+  // state cannot be reported as a completed local logout. Dispatch and completion retain
+  // the captured generation and cannot revoke or clear a later adopted identity.
   async function logout(): Promise<void> {
     const expected = authenticationEpoch()
     if (authMode.value === 'central') {
-      await centralAuthAPI.logout()
-      if (authenticationEpoch() === expected) clearAuth()
-      return
+      await centralAuthAPI.logout(expected)
+    } else {
+      await authAPI.logout(expected)
     }
-    try {
-      await authAPI.logout()
-    } catch (err) {
-      // Legacy revocation keeps its established local-logout behavior. Ownership is
-      // checked again below before removing any state belonging to a later session.
-      console.warn('Logout API call failed, clearing local session anyway', err)
-    } finally {
-      if (authenticationEpoch() === expected) clearAuth()
-    }
+    if (authenticationEpoch() === expected) clearAuth()
   }
 
   // refreshUser refreshes the current product profile without changing session ownership.

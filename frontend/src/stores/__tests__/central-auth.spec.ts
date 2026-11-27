@@ -3,7 +3,11 @@ import { createPinia, setActivePinia } from 'pinia'
 import { useAuthStore } from '@/stores/auth'
 import axios from 'axios'
 import { refreshAuthTokens } from '@/api/tokenRefresh'
-import { centralTransport, replaceAuthentication } from '@/api/authenticationContext'
+import {
+  authenticationEpoch,
+  centralTransport,
+  replaceAuthentication,
+} from '@/api/authenticationContext'
 
 // central-auth.spec.ts exercises cookie-session publication, expiration, and competing
 // authentication completions through the production store. Controlled endpoint promises
@@ -25,7 +29,7 @@ const endpoints = vi.hoisted(() => ({
   logout: vi.fn(), // Durable central logout response.
   login: vi.fn(), // Legacy login response fixture.
   profile: vi.fn(), // Legacy profile response fixture.
-  legacyLogout: vi.fn(), // Legacy logout response fixture.
+  legacyLogout: vi.fn(), // Generic cookie-or-legacy withdrawal response.
   refresh: vi.fn(), // Legacy token renewal response.
 }))
 vi.mock('@/api/centralAuth', () => ({ centralAuthAPI: endpoints }))
@@ -379,19 +383,109 @@ describe('central browser session ownership', () => {
     expect(centralTransport()).toBeNull()
   })
 
-  // Initial restoration is suspended while logout ends the local authentication generation.
-  // Completing the old metadata request cannot recreate the cleared session afterward.
-  it('cannot resurrect authentication from a late bootstrap response', async () => {
+  // A pending cookie restoration has not yet published the proof needed for central logout.
+  // A server refusal preserves its ownership and stored credentials so restoration and withdrawal can be retried.
+  it.each(['callback', 'bootstrap'])(
+    'rejects unproven logout while %s restoration is pending',
+    async (kind) => {
+      localStorage.setItem('auth_token', 'retained-access')
+      localStorage.setItem('refresh_token', 'retained-refresh')
+      localStorage.setItem('auth_user', JSON.stringify(user))
+      const pending = Promise.withResolvers<ReturnType<typeof sessionResponse>>()
+      endpoints.session.mockReturnValueOnce(pending.promise)
+      const restoration =
+        kind === 'callback' ? store.restoreCentralSession() : store.initializeSession()
+      const owner = authenticationEpoch()
+      endpoints.legacyLogout.mockRejectedValueOnce({ status: 403, code: 'CENTRAL_PROOF_REQUIRED' })
+
+      await expect(store.logout()).rejects.toMatchObject({
+        status: 403,
+        code: 'CENTRAL_PROOF_REQUIRED',
+      })
+      expect(authenticationEpoch()).toBe(owner)
+      expect(localStorage.getItem('auth_token')).toBe('retained-access')
+      expect(localStorage.getItem('refresh_token')).toBe('retained-refresh')
+      expect(endpoints.legacyLogout).toHaveBeenCalledExactlyOnceWith(owner)
+      expect(endpoints.logout).not.toHaveBeenCalled()
+
+      pending.resolve(sessionResponse())
+      await restoration
+      expect(store.isAuthenticated).toBe(true)
+      endpoints.logout.mockResolvedValueOnce(undefined)
+      await store.logout()
+      expect(store.isAuthenticated).toBe(false)
+      expect(centralTransport()).toBeNull()
+    },
+  )
+
+  // An enabled-service refusal must not erase the legacy identity awaiting a withdrawal decision.
+  // A later successful generic response permits cleanup without borrowing central bootstrap status.
+  it('keeps generic logout failure observable and permits a confirmed retry', async () => {
+    endpoints.login.mockResolvedValue({
+      access_token: 'legacy-access',
+      refresh_token: 'legacy-refresh',
+      expires_in: 3600,
+      user,
+    })
+    await store.login({ email: user.email, password: 'test-only' })
+    const owner = authenticationEpoch()
+    endpoints.legacyLogout.mockRejectedValueOnce({ status: 503, code: 'CENTRAL_UNAVAILABLE' })
+    await expect(store.logout()).rejects.toMatchObject({ status: 503 })
+    expect(authenticationEpoch()).toBe(owner)
+    expect(store.isAuthenticated).toBe(true)
+    expect(localStorage.getItem('auth_token')).toBe('legacy-access')
+    endpoints.legacyLogout.mockResolvedValueOnce(undefined)
+    await store.logout()
+    expect(store.isAuthenticated).toBe(false)
+    expect(localStorage.getItem('auth_token')).toBeNull()
+  })
+
+  // The generic endpoint confirms an absent or already-inert cookie before obsolete metadata arrives.
+  // That successful server decision advances ownership and prevents the old response from restoring authority.
+  it('cannot restore obsolete metadata after server-confirmed generic logout', async () => {
     const pending = Promise.withResolvers<ReturnType<typeof sessionResponse>>()
-    endpoints.session.mockReturnValue(pending.promise)
-    const obsolete = store.restoreCentralSession()
+    endpoints.session.mockReturnValueOnce(pending.promise)
+    const obsolete = store.initializeSession()
     const rejected = expect(obsolete).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' })
+    endpoints.legacyLogout.mockResolvedValueOnce(undefined)
     await store.logout()
     pending.resolve(sessionResponse())
     await rejected
     expect(store.isAuthenticated).toBe(false)
     expect(centralTransport()).toBeNull()
   })
+
+  // A withdrawal response can arrive after a different login has published new authority.
+  // Both selected transports retain the original owner and leave the replacement untouched.
+  it.each(['central', 'legacy'])(
+    'preserves a later login when %s logout completes',
+    async (kind) => {
+      if (kind === 'central') {
+        await store.restoreCentralSession()
+      } else {
+        endpoints.login.mockResolvedValueOnce({ access_token: 'earlier-access', user })
+        await store.login({ email: user.email, password: 'test-only' })
+      }
+      const owner = authenticationEpoch()
+      const pending = Promise.withResolvers<void>()
+      const endpoint = kind === 'central' ? endpoints.logout : endpoints.legacyLogout
+      endpoint.mockReturnValueOnce(pending.promise)
+      const withdrawal = store.logout()
+      expect(endpoint).toHaveBeenCalledExactlyOnceWith(owner)
+      endpoints.login.mockResolvedValueOnce({
+        access_token: 'replacement-access',
+        refresh_token: 'replacement-refresh',
+        user: { ...user, id: 19 },
+      })
+      await store.login({ email: user.email, password: 'replacement-only' })
+      pending.resolve()
+      await withdrawal
+      expect(store.isAuthenticated).toBe(true)
+      expect(store.user?.id).toBe(19)
+      expect(localStorage.getItem('auth_token')).toBe('replacement-access')
+      expect(localStorage.getItem('refresh_token')).toBe('replacement-refresh')
+    },
+  )
 
   // A different server session appears while the existing tab refreshes its profile.
   // Changed identity or CSRF ownership clears the old view instead of silently switching users.

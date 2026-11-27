@@ -1,5 +1,10 @@
+import type { AxiosRequestConfig } from 'axios'
 import { apiClient } from './client'
-import { authenticationEpoch, assertAuthenticationEpoch } from './authenticationContext'
+import {
+  authenticationEpoch,
+  assertAuthenticationEpoch,
+  type AuthenticationRequest,
+} from './authenticationContext'
 import { buildApiUrl } from './url'
 import { refreshAuthTokens, type RefreshTokenResponse } from './tokenRefresh'
 export type { RefreshTokenResponse } from './tokenRefresh'
@@ -173,8 +178,8 @@ export function getAuthToken(): string | null {
 
 /**
  * getRefreshToken reads the rotation credential from browser storage. A missing
- * entry returns null, letting logout skip server revocation and refresh callers
- * detect that session rotation is unavailable.
+ * entry returns null, omitting the optional logout refresh payload and letting
+ * refresh callers detect that session rotation is unavailable.
  */
 export function getRefreshToken(): string | null {
   return localStorage.getItem('refresh_token')
@@ -291,23 +296,19 @@ export async function getCurrentUser() {
 }
 
 /**
- * logout attempts to revoke the stored refresh token before clearing local
- * authentication values. Revocation errors are ignored so local logout can still
- * complete; localStorage access errors continue to propagate. A session adopted
- * during revocation owns its credentials and is preserved by the generation check.
+ * logout asks the server to withdraw the actual browser session before clearing
+ * local authentication values. The request is sent even without a refresh token,
+ * because an opaque central cookie may still require durable revocation. Every
+ * rejection propagates instead of claiming local logout completed. The captured
+ * generation reaches Axios before dispatch, and a later session keeps its own
+ * credentials when the earlier request completes.
  */
-export async function logout(): Promise<void> {
-  const expected = authenticationEpoch()
+export async function logout(expected = authenticationEpoch()): Promise<void> {
   const refreshToken = getRefreshToken()
-
-  // Try to revoke the refresh token on the server
-  if (refreshToken) {
-    try {
-      await apiClient.post('/auth/logout', { refresh_token: refreshToken })
-    } catch {
-      // A failed server revocation should still allow this browser to log out, so continue to clear local session values.
-    }
+  const options: AxiosRequestConfig & Pick<AuthenticationRequest, '_authenticationEpoch'> = {
+    _authenticationEpoch: expected,
   }
+  await apiClient.post('/auth/logout', refreshToken ? { refresh_token: refreshToken } : {}, options)
 
   if (authenticationEpoch() === expected) clearAuthToken()
 }

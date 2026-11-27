@@ -90,7 +90,9 @@ export function subscribeCentralExpiration(listener: (expiredEpoch: number) => v
   }
 }
 
-// isCentralAuthenticationPath recognizes the reserved same-origin central authentication API.
-export function isCentralAuthenticationPath(url: string | undefined): boolean {
-  return /^\/auth\/central\//.test(url || '')
+// isCookieOnlyAuthenticationPath recognizes central authentication and shared withdrawal.
+// The generic logout endpoint selects its own cookie or refresh-token body; it needs
+// no access bearer and must never trigger legacy refresh or credential cleanup on refusal.
+export function isCookieOnlyAuthenticationPath(url: string | undefined): boolean {
+  return /^\/auth\/central\//.test(url || '') || url === '/auth/logout'
 }

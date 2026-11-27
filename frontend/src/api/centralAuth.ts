@@ -2,6 +2,7 @@ import type { AxiosRequestConfig } from 'axios'
 import { apiClient } from './client'
 import type { ActionCaptchaRequestProof } from './auth.types'
 import type { User } from './identity.types'
+import { authenticationEpoch, type AuthenticationRequest } from './authenticationContext'
 
 // centralAuth.ts exchanges browser login intent and session metadata with GetTok's
 // central authentication backend. Authorization codes and provider tokens remain on
@@ -89,9 +90,15 @@ async function session(): Promise<CentralSession> {
 
 // logout revokes the current cookie session using the memory-held anti-CSRF proof.
 // Network and storage failures propagate so callers can offer a real retry. A local
-// state change must not be reported as completed server-side session revocation.
-async function logout(): Promise<void> {
-  await apiClient.post('/auth/central/logout')
+// state change must not be reported as completed server-side session revocation. The
+// captured owner reaches Axios before its asynchronous request queue can select headers.
+// Callers may supply the generation that owned an earlier session decision; omitting
+// it captures the owner immediately when this operation starts.
+async function logout(expectedEpoch = authenticationEpoch()): Promise<void> {
+  const options: AxiosRequestConfig & Pick<AuthenticationRequest, '_authenticationEpoch'> = {
+    _authenticationEpoch: expectedEpoch,
+  }
+  await apiClient.post('/auth/central/logout', undefined, options)
 }
 
 // centralAuthAPI groups the browser-facing operations of the central authentication boundary.

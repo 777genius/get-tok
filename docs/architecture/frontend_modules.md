@@ -68,7 +68,7 @@ API 记录按所属领域维护在 `api/*.types.ts` 或 `api/admin/*.types.ts`�
 
 首次导航先通过同源 BFF 的 `/auth/central/session` 判断 cookie，只有 401、404 或明确的 `CENTRAL_DISABLED` 才恢复 legacy storage；网络错误和服务故障不能降级为旧身份。已经确认的中央会话无需重复读取。无错误参数的中央 callback 自己处理恢复：先停止旧会话的定时任务、清空内存身份并增加 generation，保留尚未验证的持久凭据，确认 cookie 后才删除旧凭据并发布中央身份。允许的固定错误参数保留在 URL 中，重载该错误页面不会读取 session；code、token、state、fragment 和自定义 redirect 均被拒绝。登录及注册按钮使用服务器声明的 provider，并沿用父表单已有的协议和 captcha 条件；无绑定的 login 不能自动变为注册或邮箱合并。
 
-会话替换增加文档内的 generation。请求派发、响应发布、刷新后的 retry 以及 legacy API 的存储写入都核对原 generation；队列中的旧请求不能借用新会话重新执行。中央认证不调用 legacy refresh，profile 轮询也不延长原 deadline。中央 logout 等待服务端确认撤销，失败时保留当前页面以便重试；403 的额外证明要求不会被当成退出。部署及原生浏览器验证入口见[共享身份部署](../operations/shared_identity_deployment.md)。
+会话替换增加文档内的 generation。请求派发、响应发布、刷新后的 retry 以及 legacy API 的存储写入都核对原 generation；队列中的旧请求不能借用新会话重新执行。中央认证不调用 legacy refresh，profile 轮询也不延长原 deadline。logout 始终向服务器发送请求，没有 legacy refresh token 时也不能仅清空本地状态。已有中央身份时使用中央 logout；恢复中的未知状态由通用 `/auth/logout` 根据 cookie 和持久撤销记录判断，缺少匹配 proof 时拒绝。请求在进入 HTTP 队列前绑定 generation，服务端成功响应后才清理同一 generation 的本地状态；网络错误和拒绝响应保留可重试状态，403 的额外证明要求不会被当成退出。部署及原生浏览器验证入口见[共享身份部署](../operations/shared_identity_deployment.md)。
 
 ### 应用启动
 
