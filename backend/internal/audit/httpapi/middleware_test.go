@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/TokenFlux/TokenRouter/internal/audit"
 	"github.com/TokenFlux/TokenRouter/internal/identity/httpapi/authctx"
+	"github.com/TokenFlux/TokenRouter/internal/infra/telemetry"
 	"github.com/TokenFlux/TokenRouter/internal/pkg/apperror"
 )
 
@@ -240,6 +242,54 @@ func TestOllamaCloudUsageSessionRouteOmitsAuditBody(t *testing.T) {
 	require.Len(t, logs, 1)
 	require.Equal(t, "<credential-bearing body omitted>", logs[0].RequestBody)
 	require.NotContains(t, logs[0].RequestBody, "audit-canary")
+}
+
+// TestCentralStartAuditOmitsCredentials preserves an unchanged downstream
+// payload while recording accepted and refused starts through the real audit
+// writer. Only the omission marker and nonsecret outcome metadata may persist.
+func TestCentralStartAuditOmitsCredentials(t *testing.T) {
+	const payload = `{"intent":"register","invitation_code":"central-audit-canary-invitation","password":"central-audit-canary-password","totp_code":"central-audit-canary-factor","tencent_captcha_ticket":"central-audit-canary-ticket","tencent_captcha_randstr":"central-audit-canary-random"}`
+	for _, status := range []int{http.StatusOK, http.StatusBadRequest} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			repository := &auditCaptureRepository{}
+			service := audit.NewAuditLogService(repository, nil)
+			service.Start()
+			t.Cleanup(service.Stop)
+			var received string
+			router := gin.New()
+			router.Use(gin.HandlerFunc(NewAuditLogMiddleware(service, audit.NewRedactor(nil))))
+			router.POST("/api/v1/auth/central/start", func(c *gin.Context) {
+				body, err := io.ReadAll(c.Request.Body)
+				require.NoError(t, err)
+				received = string(body)
+				SetAuditActor(c, 41, "owner@example.invalid")
+				c.Status(status)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/central/start", bytes.NewBufferString(payload))
+			request.Header.Set("Content-Type", "application/json")
+			request = request.WithContext(context.WithValue(request.Context(), telemetry.RequestID, "server-audit-request-id"))
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			require.Equal(t, status, recorder.Code)
+			require.Equal(t, payload, received)
+			service.Stop()
+			repository.mu.Lock()
+			logs := append([]*audit.AuditLog(nil), repository.logs...)
+			repository.mu.Unlock()
+			require.Len(t, logs, 1)
+			require.Equal(t, "<credential-bearing body omitted>", logs[0].RequestBody)
+			require.Equal(t, "auth.central.start.create", logs[0].Action)
+			require.Equal(t, "/api/v1/auth/central/start", logs[0].Path)
+			require.Equal(t, status, logs[0].StatusCode)
+			require.Equal(t, "server-audit-request-id", logs[0].RequestID)
+			require.NotNil(t, logs[0].ActorUserID)
+			require.Equal(t, int64(41), *logs[0].ActorUserID)
+			require.Equal(t, "owner@example.invalid", logs[0].ActorEmail)
+			encoded, err := json.Marshal(logs[0])
+			require.NoError(t, err)
+			require.NotContains(t, string(encoded), "central-audit-canary")
+		})
+	}
 }
 
 // TestCredentialPayloadRoutesOmitAuditBody checks endpoints carrying opaque authentication

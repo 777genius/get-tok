@@ -3,51 +3,128 @@ package middleware
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 
+	"github.com/TokenFlux/TokenRouter/internal/infra/telemetry/logging"
 	"github.com/TokenFlux/TokenRouter/internal/pkg/apperror"
 	response "github.com/TokenFlux/TokenRouter/internal/server/httpx"
 )
 
-// Panic recovery has separate diagnostic and public-response effects. These
-// cases inspect Gin's captured panic output and compare the ordinary JSON
-// envelope with a response already committed before the panic, keeping its sent
-// body intact.
+// recovery_test.go checks public responses and authentication-safe panic
+// diagnostics through the real middleware order and application log sink.
+// Request and panic canaries must stay out of both Gin's diagnostic writer and
+// retained structured events, while response commitment and broken-connection
+// behavior remain distinct.
 
-// TestRecovery_PanicLogContainsInfo raises a named panic under the project
-// recovery middleware. The response returns 500 and Gin's captured diagnostics
-// contain both the panic message and a stack-file reference.
-func TestRecovery_PanicLogContainsInfo(t *testing.T) {
-	// Replace Gin's process-wide diagnostic writer before constructing Recovery,
-	// which captures that writer. Restore it at cleanup so later serial tests use
-	// their own destination.
-	var buf bytes.Buffer
-	originalWriter := gin.DefaultErrorWriter
-	gin.DefaultErrorWriter = &buf
-	t.Cleanup(func() {
-		gin.DefaultErrorWriter = originalWriter
-	})
-
-	r := gin.New()
-	r.Use(Recovery())
-	r.GET("/panic", func(c *gin.Context) {
-		panic("custom panic message for test")
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
-	r.ServeHTTP(w, req)
-
-	require.Equal(t, http.StatusInternalServerError, w.Code)
-
-	logOutput := buf.String()
-	require.Contains(t, logOutput, "custom panic message for test", "日志应包含 panic 信息")
-	require.Contains(t, logOutput, "recovery_test.go", "日志应包含堆栈跟踪文件名")
+// TestRecoveryAuthenticationSecretsStayOutOfDiagnostics exercises ordinary and
+// broken-connection panics in release and debug modes. Both diagnostic
+// destinations and Gin's retained errors remain free of request or panic data.
+func TestRecoveryAuthenticationSecretsStayOutOfDiagnostics(t *testing.T) {
+	const canary = "recovery-private-canary"
+	broken := &net.OpError{Op: "write", Net: "tcp", Err: &os.SyscallError{Syscall: "write", Err: errors.New("broken pipe " + canary)}}
+	for _, mode := range []string{gin.ReleaseMode, gin.DebugMode} {
+		t.Run(mode, func(t *testing.T) {
+			originalMode := gin.Mode()
+			gin.SetMode(mode)
+			t.Cleanup(func() { gin.SetMode(originalMode) })
+			for _, row := range []struct {
+				name      string // panic classification used for this request
+				recovered any    // secret-bearing value raised by the handler
+				broken    bool   // whether another response write must be avoided
+			}{
+				{"string", canary, false},
+				{"error", errors.New(canary), false},
+				{"broken", broken, true},
+				{"wrapped_broken", fmt.Errorf("%s: %w", canary, broken), true},
+			} {
+				t.Run(row.name, func(t *testing.T) {
+					sink := initMiddlewareTestLogger(t)
+					diagnosticPath := filepath.Join(t.TempDir(), "recovery.jsonl")
+					options := logging.InitOptions{
+						Level:           "debug",
+						Format:          "json",
+						ServiceName:     "tokenrouter",
+						Environment:     "test",
+						StacktraceLevel: "error",
+						Output:          logging.OutputOptions{ToFile: true, FilePath: diagnosticPath},
+					}
+					require.NoError(t, logging.Init(options))
+					t.Cleanup(func() {
+						logging.Sync()
+						options.Output = logging.OutputOptions{ToStdout: true}
+						require.NoError(t, logging.Init(options))
+						require.NoError(t, logging.CloseFiles())
+					})
+					var ginOutput bytes.Buffer
+					originalWriter := gin.DefaultErrorWriter
+					gin.DefaultErrorWriter = &ginOutput
+					t.Cleanup(func() { gin.DefaultErrorWriter = originalWriter })
+					var observed *gin.Context
+					router := gin.New()
+					router.Use(Recovery(), RequestLogger(), Logger())
+					router.GET("/api/v1/auth/central/callback", func(c *gin.Context) {
+						observed = c
+						panic(row.recovered)
+					})
+					request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/central/callback?code="+canary+"-code&state="+canary+"-state", strings.NewReader(canary+"-body"))
+					request.Header.Set("Authorization", "Bearer "+canary+"-bearer")
+					request.Header.Set("Cookie", "__Host-gettok-central="+canary+"-session; __Host-gettok-central-login="+canary+"-transaction")
+					request.Header.Set("X-CSRF-Token", canary+"-csrf")
+					request.Header.Set("X-Request-ID", canary+"-caller")
+					recorder := httptest.NewRecorder()
+					router.ServeHTTP(recorder, request)
+					require.True(t, observed.IsAborted())
+					if row.broken {
+						require.False(t, observed.Writer.Written())
+						require.Empty(t, recorder.Body.String())
+						require.Len(t, observed.Errors, 1)
+						require.EqualError(t, observed.Errors[0].Err, "response connection closed")
+					} else {
+						require.Equal(t, http.StatusInternalServerError, recorder.Code)
+						require.Empty(t, observed.Errors)
+					}
+					events := sink.list()
+					require.Len(t, events, 1)
+					require.Equal(t, "handler panic recovered", events[0].Message)
+					require.Equal(t, "http.recovery", events[0].Fields["component"])
+					require.Equal(t, recorder.Header().Get(requestIDHeader), events[0].Fields["request_id"])
+					require.Len(t, recorder.Header().Get(requestIDHeader), 36)
+					require.Equal(t, http.MethodGet, events[0].Fields["method"])
+					require.Equal(t, "/api/v1/auth/central/callback", events[0].Fields["route"])
+					require.Equal(t, row.broken, events[0].Fields["broken_connection"])
+					stack, ok := events[0].Fields["stack"].(string)
+					require.True(t, ok)
+					require.Contains(t, stack, "recovery_test.go")
+					require.LessOrEqual(t, strings.Count(stack, "\n"), 32)
+					logging.Sync()
+					diagnostics, err := os.ReadFile(diagnosticPath)
+					require.NoError(t, err)
+					var written map[string]any
+					require.NoError(t, json.Unmarshal(bytes.TrimSpace(diagnostics), &written))
+					require.Equal(t, events[0].Message, written["msg"])
+					require.Equal(t, events[0].Fields["request_id"], written["request_id"])
+					require.Equal(t, events[0].Fields["route"], written["route"])
+					require.Equal(t, stack, written["stack"])
+					require.NotContains(t, written, "stacktrace")
+					encoded, err := json.Marshal(events)
+					require.NoError(t, err)
+					require.NotContains(t, ginOutput.String()+string(diagnostics)+string(encoded)+observed.Errors.String()+recorder.Body.String(), canary)
+					require.Empty(t, ginOutput.String())
+				})
+			}
+		})
+	}
 }
 
 // TestRecovery compares an unwritten panic, successful handling, and a panic
