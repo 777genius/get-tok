@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
 
 	dbent "github.com/TokenFlux/TokenRouter/ent"
@@ -107,7 +108,7 @@ func (s *AuthState) ApplyProviderDefaultSettingsOnFirstBind(
 // The unique account/provider/first_bind insert uses do-nothing conflict
 // handling; zero affected rows skip every grant write. A newly inserted claim
 // permits configured balance, concurrency, and subscription defaults in
-// sequence. The current account row is locked before the claim so a delayed
+// sequence. PostgreSQL locks the current account row before the claim so a delayed
 // legacy provider callback cannot grant entitlements after central ownership
 // activation. Errors remain inside the shared transaction and require rollback
 // by its owner, including the wrapper when no transaction was supplied.
@@ -133,12 +134,8 @@ func (s *AuthState) AuthApplyProviderDefaultSettingsOnFirstBind(
 	}
 	// Serialize legacy financial side effects with central ownership activation.
 	// A provider callback that passed an earlier login read cannot grant after binding.
-	current, err := client.User.Query().Where(dbuser.IDEQ(userID)).ForUpdate().Only(ctx)
-	if err != nil {
+	if err := requireLegacyAuthUser(ctx, client, userID); err != nil {
 		return err
-	}
-	if current.CentralManaged {
-		return identitycore.ErrCentralLoginRequired
 	}
 
 	// Insert the unique first-bind marker before entitlements and inspect its
@@ -393,7 +390,7 @@ func (s *AuthState) AuthEnsureEmailAuthIdentity(ctx context.Context, user *ident
 
 // AuthEnsureEmailOAuthIdentity creates or refreshes one provider tuple for the
 // supplied account through a joined or owned Ent transaction. The current user
-// row remains locked through provider persistence, preventing an older legacy
+// row remains locked on PostgreSQL through provider persistence, preventing an older legacy
 // callback from writing a provider binding after central ownership activation.
 //
 // The type is normalized while key and subject are trimmed before ownership
@@ -418,12 +415,8 @@ func (s *AuthState) AuthEnsureEmailOAuthIdentity(ctx context.Context, userID int
 		return tx.Commit()
 	}
 	client := dbent.TxFromContext(ctx).Client()
-	current, err := client.User.Query().Where(dbuser.IDEQ(userID)).ForUpdate().Only(ctx)
-	if err != nil {
+	if err := requireLegacyAuthUser(ctx, client, userID); err != nil {
 		return err
-	}
-	if current.CentralManaged {
-		return identitycore.ErrCentralLoginRequired
 	}
 	metadata := map[string]any{
 		"email":          strings.TrimSpace(strings.ToLower(input.Email)),
@@ -470,6 +463,29 @@ func (s *AuthState) AuthEnsureEmailOAuthIdentity(ctx context.Context, userID int
 		SetMetadata(metadata).
 		Save(ctx)
 	return err
+}
+
+// requireLegacyAuthUser checks current ownership before legacy authentication
+// writes using the caller's transaction client. PostgreSQL retains its row lock
+// until that transaction finishes, serializing these writes with central
+// ownership activation. SQLite fixtures cannot express SELECT FOR UPDATE and
+// use their existing transaction isolation instead; they still reject a
+// central-managed owner and propagate every lookup error. This compatibility
+// path neither qualifies row-lock concurrency nor adds SQLite support to the
+// PostgreSQL-only central session store.
+func requireLegacyAuthUser(ctx context.Context, client *dbent.Client, userID int64) error {
+	query := client.User.Query().Where(dbuser.IDEQ(userID))
+	if client.Driver().Dialect() != dialect.SQLite {
+		query = query.ForUpdate()
+	}
+	current, err := query.Only(ctx)
+	if err != nil {
+		return err
+	}
+	if current.CentralManaged {
+		return identitycore.ErrCentralLoginRequired
+	}
+	return nil
 }
 
 // AuthFindEmailOAuthIdentityOwner resolves the exact supplied provider tuple
